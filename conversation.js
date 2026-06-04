@@ -1,4 +1,7 @@
 import SECTIONS from "./sections.js";
+import fs from "fs";
+import path from "path";
+import os from "os";
 import {
   SYSTEM_PROMPT,
   EXTRACTION_PROMPT,
@@ -14,6 +17,7 @@ import {
   generateTransition,
   generateWelcome,
   generateSummary,
+  transcribeAudio,
 } from "./llm.js";
 import {
   simulateTyping,
@@ -22,6 +26,7 @@ import {
   fillTemplate,
   formatSummaryForTelegram,
   delay,
+  createOptionsKeyboard,
 } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -66,6 +71,7 @@ function getState(chatId) {
       completed: false,
       startedAt: Date.now(),
       lastActivity: Date.now(),
+      stateHistory: [],
     });
   }
   const state = userStates.get(chatId);
@@ -277,11 +283,17 @@ export async function handleStatus(ctx) {
  * Handle an incoming text message during onboarding.
  */
 export async function handleMessage(ctx) {
+  const userMessage = ctx.message?.text?.trim();
+  if (!userMessage) return;
+  await processUserMessage(ctx, userMessage);
+}
+
+/**
+ * Core logic for processing a user's text input
+ */
+export async function processUserMessage(ctx, userMessage) {
   const chatId = ctx.chat.id;
   const state = getState(chatId);
-  const userMessage = ctx.message?.text?.trim();
-
-  if (!userMessage) return;
 
   // If completed, tell them
   if (state.completed) {
@@ -336,6 +348,17 @@ export async function handleMessage(ctx) {
   }
 
   // --- Step 2: Store extracted fields ---
+  if (Object.keys(extracted).length > 0) {
+    // Save snapshot for /undo feature
+    state.stateHistory.push({
+      currentSectionIndex: state.currentSectionIndex,
+      currentGroupIndex: state.currentGroupIndex,
+      data: JSON.parse(JSON.stringify(state.data)),
+      awaitingPhoto: state.awaitingPhoto,
+      completed: state.completed,
+    });
+  }
+
   for (const [key, value] of Object.entries(extracted)) {
     if (value !== null && value !== undefined && value !== "") {
       state.data[key] = value;
@@ -436,7 +459,12 @@ export async function handleMessage(ctx) {
     }
   }
 
-  await sendBotMessage(ctx, state, response);
+  let keyboard = null;
+  if (currentMissing.length > 0 && currentMissing[0].options && currentMissing[0].options.length <= 12) {
+    keyboard = createOptionsKeyboard(currentMissing[0].key, currentMissing[0].options);
+  }
+
+  await sendBotMessage(ctx, state, response, keyboard);
 }
 
 /**
@@ -644,18 +672,155 @@ async function handleReviewResponse(ctx, state, userMessage) {
 // Utility: send a message and track in history
 // ---------------------------------------------------------------------------
 
-async function sendBotMessage(ctx, state, text) {
+async function sendBotMessage(ctx, state, text, keyboard = null) {
   const messages = splitMessages(text, 4000);
 
   for (let i = 0; i < messages.length; i++) {
     if (i > 0) {
       await simulateTyping(ctx, calculateTypingDelay(messages[i]));
     }
-    await ctx.reply(messages[i]);
+    const options = { parse_mode: "HTML" };
+    // Only attach keyboard to the very last message chunk
+    if (keyboard && i === messages.length - 1) {
+      options.reply_markup = keyboard;
+    }
+    try {
+      await ctx.reply(messages[i], options);
+    } catch {
+      await ctx.reply(messages[i]);
+    }
     if (i < messages.length - 1) {
       await delay(400);
     }
   }
 
   addToHistory(state, "Bot", text);
+}
+
+// ---------------------------------------------------------------------------
+// PM Features: Voice & Callbacks
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle incoming voice notes
+ */
+export async function handleVoice(ctx) {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  if (state.completed) {
+    await ctx.reply("You've already completed the onboarding! 🎉");
+    return;
+  }
+  
+  await ctx.api.sendChatAction(chatId, "typing");
+  
+  try {
+    const file = await ctx.getFile();
+    const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+    
+    const tmpPath = path.join(os.tmpdir(), `voice_${chatId}_${Date.now()}.ogg`);
+    fs.writeFileSync(tmpPath, Buffer.from(buffer));
+    
+    await simulateTyping(ctx, 1000);
+    const text = await transcribeAudio(tmpPath);
+    fs.unlinkSync(tmpPath);
+    
+    await ctx.reply(`<i>🎙 Transcribed: "${text}"</i>`, { parse_mode: "HTML" });
+    
+    await processUserMessage(ctx, text);
+  } catch (err) {
+    console.error("[Voice] Error processing voice note:", err);
+    await ctx.reply("Sorry, I had trouble processing that voice note. Could you type it out instead?");
+  }
+}
+
+/**
+ * Handle inline keyboard button clicks
+ */
+export async function handleCallbackQuery(ctx) {
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+  
+  if (data === "undo") {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    await handleUndo(ctx);
+    return;
+  }
+  
+  if (!data.startsWith("ans_")) return;
+  
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  if (state.completed) {
+    await ctx.answerCallbackQuery({ text: "You've already finished onboarding!" });
+    return;
+  }
+  
+  const parts = data.split("_");
+  const idx = parseInt(parts.pop(), 10);
+  const fieldKey = parts.slice(1).join("_");
+  
+  let field = null;
+  for (const sec of SECTIONS) {
+    const f = sec.fields.find(x => x.key === fieldKey);
+    if (f) {
+      field = f;
+      break;
+    }
+  }
+  
+  if (field && field.options && field.options[idx]) {
+    const answer = field.options[idx];
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    await ctx.reply(`👉 ${answer}`);
+    
+    await processUserMessage(ctx, answer);
+  } else {
+    await ctx.answerCallbackQuery({ text: "Invalid option." });
+  }
+}
+
+/**
+ * Handle the /undo command or "Undo" button
+ */
+export async function handleUndo(ctx) {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  
+  if (state.stateHistory && state.stateHistory.length > 0) {
+    const previousState = state.stateHistory.pop();
+    state.currentSectionIndex = previousState.currentSectionIndex;
+    state.currentGroupIndex = previousState.currentGroupIndex;
+    state.data = previousState.data;
+    state.awaitingPhoto = previousState.awaitingPhoto;
+    state.completed = previousState.completed;
+    
+    await simulateTyping(ctx, 1000);
+    await ctx.reply("⏪ <i>Undoing your last answer...</i>", { parse_mode: "HTML" });
+    
+    // Check what is missing now and ask
+    const section = getCurrentSection(state);
+    const missing = getMissingFieldsInGroup(state);
+    
+    if (missing.length > 0) {
+      let keyboard = null;
+      if (missing[0].options && missing[0].options.length <= 12) {
+        keyboard = createOptionsKeyboard(missing[0].key, missing[0].options);
+      }
+      await sendBotMessage(ctx, state, missing[0].question, keyboard);
+    } else {
+      await ctx.reply("Ready to continue! Just say 'hi' or tell me your answer.");
+    }
+  } else {
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: "Can't go back any further!" });
+    } else {
+      await ctx.reply("Can't go back any further!");
+    }
+  }
 }
