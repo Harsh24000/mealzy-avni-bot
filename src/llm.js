@@ -1,10 +1,14 @@
 import Groq from 'groq-sdk';
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-const BOT_NAME = process.env.BOT_NAME || 'Avni';
+let _groq = null;
+function getGroq() {
+  if (!_groq) _groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  return _groq;
+}
 
-const SYSTEM_PROMPT = `You are ${BOT_NAME}, a warm and experienced fitness and nutrition coach at Mealzy — a weight-loss coaching startup. You're onboarding a new client through Telegram to understand them before building their personalized plan.
+const BOT_NAME = () => process.env.BOT_NAME || 'Avni';
+
+const SYSTEM_PROMPT = () => `You are ${BOT_NAME()}, a warm and experienced fitness and nutrition coach at Mealzy — a weight-loss coaching startup. You're onboarding a new client through Telegram to understand them before building their personalized plan.
 
 YOUR PERSONALITY:
 - You speak like a real human coach, not a chatbot. Short, natural messages.
@@ -91,6 +95,51 @@ CRITICAL RULES:
 - For numeric fields (age, weight, height, steps, hours): extract just the number with unit if applicable.
 - Never make up information. Never pretend to know things about the user you weren't told.`;
 
+function localValidate(userMessage, expectedType) {
+  const msg = userMessage.trim();
+  const type = (expectedType || '').toLowerCase();
+
+  if (type.includes('age') || type.includes('integer')) {
+    const n = Number(msg);
+    if (!isNaN(n) && n >= 5 && n <= 120) {
+      return { classification: 'VALID_ANSWER', extractedValue: String(n), reply: 'Got it!', advance: true };
+    }
+    return { classification: 'INVALID_ANSWER', extractedValue: null, reply: "I need your age as a number — how old are you?", advance: false };
+  }
+
+  if (type.includes('weight') || type.includes('height')) {
+    const n = parseFloat(msg);
+    if (!isNaN(n) && n > 0) {
+      return { classification: 'VALID_ANSWER', extractedValue: msg, reply: 'Got it!', advance: true };
+    }
+    return { classification: 'INVALID_ANSWER', extractedValue: null, reply: "Can you give me that as a number?", advance: false };
+  }
+
+  if (type.includes('name')) {
+    if (msg.length >= 2 && /[a-zA-Z]/.test(msg)) {
+      return { classification: 'VALID_ANSWER', extractedValue: msg, reply: 'Nice to meet you!', advance: true };
+    }
+    return { classification: 'INVALID_ANSWER', extractedValue: null, reply: "What should I call you? Even a nickname is fine!", advance: false };
+  }
+
+  if (type.includes('hours') || type.includes('steps') || type.includes('1000')) {
+    const n = parseFloat(msg);
+    if (!isNaN(n) && n >= 0) {
+      return { classification: 'VALID_ANSWER', extractedValue: String(n), reply: 'Got it!', advance: true };
+    }
+    if (/don't|no|not|track/i.test(msg)) {
+      return { classification: 'VALID_ANSWER', extractedValue: msg, reply: 'Got it!', advance: true };
+    }
+    return { classification: 'INVALID_ANSWER', extractedValue: null, reply: "Can you give me a rough number?", advance: false };
+  }
+
+  if (msg.length >= 3) {
+    return { classification: 'VALID_ANSWER', extractedValue: msg, reply: 'Got it!', advance: true };
+  }
+
+  return { classification: 'INVALID_ANSWER', extractedValue: null, reply: "Could you tell me a bit more?", advance: false };
+}
+
 export async function validateAndReply({ question, expectedType, hint, userMessage, nextQuestion }) {
   const userPrompt = JSON.stringify({
     currentQuestion: question,
@@ -101,10 +150,11 @@ export async function validateAndReply({ question, expectedType, hint, userMessa
   });
 
   try {
-    const completion = await groq.chat.completions.create({
-      model: MODEL,
+    const model = process.env.GROQ_MODEL || 'llama3-70b-8192';
+    const completion = await getGroq().chat.completions.create({
+      model,
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: SYSTEM_PROMPT() },
         { role: 'user', content: userPrompt },
       ],
       temperature: 0.72,
@@ -113,21 +163,17 @@ export async function validateAndReply({ question, expectedType, hint, userMessa
     });
 
     const text = completion.choices[0].message.content;
-    const parsed = JSON.parse(text);
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : text);
 
     return {
-      classification: parsed.classification || 'INVALID_ANSWER',
-      extractedValue: parsed.extractedValue ?? null,
-      reply: parsed.reply || "I didn't quite catch that — could you try again?",
-      advance: Boolean(parsed.advance) && parsed.extractedValue != null,
+      classification: parsed.classification || 'VALID_ANSWER',
+      extractedValue: parsed.extractedValue ?? userMessage,
+      reply: parsed.reply || "Got it!",
+      advance: Boolean(parsed.advance) && (parsed.extractedValue != null),
     };
   } catch (err) {
-    console.error('LLM error:', err.message);
-    return {
-      classification: 'ERROR',
-      extractedValue: null,
-      reply: "Sorry, I had a small hiccup! Could you send that again?",
-      advance: false,
-    };
+    console.error('LLM error:', err.message ?? err);
+    return localValidate(userMessage, expectedType);
   }
 }
