@@ -26,7 +26,11 @@ function currentStep(ctx) {
 
 function nextStepQuestion(ctx) {
   const next = STEPS[ctx.session.step + 1];
-  return next?.question ?? null;
+  // Only hand the next question to the LLM if it's a free-text step.
+  // Button/scale/multiselect/photo steps are sent separately (with their UI),
+  // so the LLM should just react warmly without re-asking them.
+  if (next && next.type === 'text') return next.question;
+  return null;
 }
 
 async function sendStep(ctx, step) {
