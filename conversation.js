@@ -231,24 +231,6 @@ export async function handleStart(ctx) {
   resetState(chatId);
   const state = getState(chatId);
 
-  // Premium branded welcome card
-  const totalSections = SECTIONS.filter(s => s.id !== 'review-submit').length;
-  const card = [
-    `🌿 <b>Welcome to Mealzy</b>`,
-    ``,
-    `India's most personalised nutrition & fitness coaching.`,
-    ``,
-    `────────────────────────`,
-    `📄 <b>Your Onboarding</b>`,
-    `${totalSections} sections · ~10–15 mins · 100% private`,
-    `────────────────────────`,
-    ``,
-    `⌨️ Type your answers &nbsp;·&nbsp; 🎙 Send voice notes &nbsp;·&nbsp; ↩️ /undo to go back`,
-  ].join('\n');
-
-  await ctx.reply(card, { parse_mode: 'HTML' });
-  await delay(800);
-
   // Generate welcome message via LLM
   const welcomePrompt = fillTemplate(WELCOME_PROMPT, { botName: BOT_NAME });
 
@@ -262,6 +244,7 @@ export async function handleStart(ctx) {
 
   await sendBotMessage(ctx, state, welcomeMsg);
 }
+
 
 /**
  * Handle the /restart command.
