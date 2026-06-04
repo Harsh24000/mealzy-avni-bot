@@ -292,6 +292,94 @@ export function formatSummaryForTelegram(sectionData, sections) {
 }
 
 // ---------------------------------------------------------------------------
+// Local response generation (zero API calls for simple field acknowledgements)
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates a warm, natural-sounding acknowledgement + next question
+ * for simple single-field responses, without any LLM call.
+ *
+ * Returns null if the situation is too complex for a local response
+ * (in which case, the caller should use Groq).
+ *
+ * @param {string}  userName       - The user's first name (or null)
+ * @param {Object}  justExtracted  - Fields just extracted { key: value }
+ * @param {Array}   nextFields     - Missing fields still to collect
+ * @param {Object}  allData        - Full collected profile so far
+ * @returns {string|null}
+ */
+export function localResponse(userName, justExtracted, nextFields, allData) {
+  const name = userName ? userName.split(' ')[0] : null;
+  const extractedKeys = Object.keys(justExtracted);
+
+  // Only handle single-field extractions
+  if (extractedKeys.length !== 1) return null;
+
+  const key = extractedKeys[0];
+  const value = justExtracted[key];
+  const next = nextFields[0];
+
+  // Acknowledgement phrases (randomised so it doesn't feel canned)
+  const acks = {
+    fullName: () => {
+      const n = String(value).split(' ')[0];
+      return pick([`nice to meet you, ${n}!`, `hey ${n}!`, `${n}, love it.`, `oh cool, ${n}!`]);
+    },
+    age: () => {
+      const v = parseInt(value);
+      if (v < 20) return pick(["oh nice, young and ambitious!", "love the energy!"]);
+      if (v > 40) return pick(["awesome, honestly the best time to start.", "respect, seriously."]);
+      return pick(["cool!", "nice.", "got it!"]);
+    },
+    heightCm: () => pick(["got it!", "noted!", "cool."]),
+    weightKg: () => pick(["ok!", "noted.", "got it."]),
+    profession: () => {
+      const v = String(value).toLowerCase();
+      if (v.includes("student")) return "ah student life! respect the hustle.";
+      if (v.includes("engineer") || v.includes("software") || v.includes("dev")) return "oh nice, a dev — you probably sit a lot huh?";
+      if (v.includes("doctor") || v.includes("nurse")) return "wow, respect — you must be exhausted a lot.";
+      return pick(["oh interesting!", "nice!", "cool."]);
+    },
+    biologicalSex: () => "",
+    default: () => pick(["ok!", "got it.", "noted!", "nice."]),
+  };
+
+  const ackFn = acks[key] || acks.default;
+  const ack = ackFn();
+
+  // If no next field, just acknowledge
+  if (!next) return ack.trim() || null;
+
+  // Build the next question naturally
+  const questions = {
+    age:          () => pick(["how old are you?", "and your age?"]),
+    heightCm:     () => pick(["how tall are you? (in cm)", "what's your height in cm?"]),
+    weightKg:     () => pick(["and your current weight in kg?", "what do you weigh right now? (kg)"]),
+    profession:   () => pick(["what do you do for work?", "and what's your profession?"]),
+    biologicalSex:() => null, // handled by keyboard, skip
+    dailyRoutine: () => pick(["walk me through a typical weekday for you — like from morning to night?", "what does a normal weekday look like for you?"]),
+    currentDiet:  () => pick(["what does your food look like on a typical day?", "walk me through what you usually eat in a day?"]),
+    averageWeekend:() => pick(["and weekends — what do those usually look like?", "how do you spend a typical weekend?"]),
+  };
+
+  const qFn = questions[next.key];
+  const q = qFn ? qFn() : null;
+
+  // If the next field has options (select), let the keyboard handle it
+  if (next.options && next.options.length > 0) return ack.trim() || null;
+
+  if (!q) return ack.trim() || null;
+
+  const parts = [ack, q].filter(Boolean);
+  return parts.join(' ').trim();
+}
+
+/** Pick a random item from an array */
+function pick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+// ---------------------------------------------------------------------------
 // Local extraction (zero API calls for simple field types)
 // ---------------------------------------------------------------------------
 
