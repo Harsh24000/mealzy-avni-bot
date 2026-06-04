@@ -1,0 +1,16 @@
+{
+  "name": "mealzy-bot",
+  "version": "1.0.0",
+  "description": "Mealzy — smart, human-like Telegram onboarding chatbot",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "grammy": "^1.35.0",
+    "groq-sdk": "^0.15.0",
+    "dotenv": "^16.5.0"
+  }
+}
