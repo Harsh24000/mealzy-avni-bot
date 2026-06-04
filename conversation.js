@@ -244,7 +244,10 @@ export async function handleStart(ctx) {
   const state = getState(chatId);
 
   // Generate welcome message via LLM
-  const welcomePrompt = fillTemplate(WELCOME_PROMPT, { botName: BOT_NAME });
+  const welcomePrompt = fillTemplate(WELCOME_PROMPT, { 
+    botName: BOT_NAME,
+    currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute:'2-digit' })
+  });
 
   await simulateTyping(ctx, 1500);
   let welcomeMsg;
@@ -354,6 +357,16 @@ export async function processUserMessage(ctx, userMessage) {
   if (state.awaitingPhoto) {
     await simulateTyping(ctx, 800);
     await ctx.reply(`I'm waiting for your ${state.awaitingPhoto.replace(/([A-Z])/g, " $1").toLowerCase().replace("photo ", "")} photo 📸\n\nJust send it as a photo and I'll save it!`);
+    return;
+  }
+
+  // Handle "BRB" protocol
+  const lowerMsg = userMessage.toLowerCase();
+  const brbPhrases = ["brb", "be right back", "need to go", "hold on", "give me a sec", "pause", "g2g", "gtg", "1 min", "wait"];
+  if (brbPhrases.some(p => lowerMsg === p || lowerMsg.startsWith(p))) {
+    state.nudgeSent = true; // Disable nudge
+    await simulateTyping(ctx, 1000);
+    await ctx.reply("no stress at all, take your time! just say 'hi' when you're back.");
     return;
   }
 
@@ -492,6 +505,7 @@ export async function processUserMessage(ctx, userMessage) {
     missingFields: buildFieldDefinitions(currentMissing),
     userProfile: buildUserProfile(state),
     conversationHistory: buildConversationHistory(state),
+    currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute:'2-digit' })
   });
 
   await simulateTyping(ctx, calculateTypingDelay("response"));
