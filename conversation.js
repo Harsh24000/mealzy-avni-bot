@@ -420,26 +420,7 @@ export async function processUserMessage(ctx, userMessage) {
       }
 
       if (advancement === "next-section") {
-        // 🎉 Section celebration + progress bar
-        const completedSection = section;
-        const totalSections = SECTIONS.filter(s => s.id !== 'review-submit').length;
-        const completedCount = state.currentSectionIndex; // already advanced
-        const progressPct = Math.round((completedCount / totalSections) * 100);
-        const progressBar = buildProgressBar(completedCount, totalSections);
-        
-        const celebrationLines = [
-          `✅ <b>${completedSection.name}</b> — done!`,
-          ``,
-          `${progressBar} ${progressPct}%`,
-          `Section ${completedCount} of ${totalSections} complete`,
-        ];
-        await delay(400);
-        try {
-          await ctx.reply(celebrationLines.join("\n"), { parse_mode: "HTML" });
-        } catch { /* non-critical */ }
-        await delay(600);
-
-        // Generate transition message to next section
+        // Generate transition message to next section (the LLM handles this naturally)
         const nextSection = getCurrentSection(state);
 
         // Special handling for photo section
