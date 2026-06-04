@@ -1,0 +1,18 @@
+{
+  "name": "mealzy-bot",
+  "version": "1.0.0",
+  "description": "Mealzy — human-like Telegram onboarding bot",
+  "main": "src/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "grammy": "^1.35.0",
+    "dotenv": "^16.5.0"
+  }
+}
