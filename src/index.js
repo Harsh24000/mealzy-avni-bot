@@ -89,6 +89,7 @@ async function finish(ctx) {
   ctx.session.data = {};
 }
 
+// /start
 bot.command('start', async (ctx) => {
   ctx.session.step = 0;
   ctx.session.data = {};
@@ -112,6 +113,7 @@ bot.command('restart', async (ctx) => {
   await sendStep(ctx, STEPS[0]);
 });
 
+// Inline button taps (buttons, scale, multiselect)
 bot.on('callback_query:data', async (ctx) => {
   const step = currentStep(ctx);
   if (!step) return ctx.answerCallbackQuery('Type /start to begin.');
@@ -144,6 +146,7 @@ bot.on('callback_query:data', async (ctx) => {
   }
 });
 
+// Text messages — run through LLM for text-type steps
 bot.on('message:text', async (ctx) => {
   if (ctx.session.step < 0) {
     return ctx.reply("Hey! Type /start to begin your Mealzy onboarding.");
@@ -152,10 +155,12 @@ bot.on('message:text', async (ctx) => {
   const step = currentStep(ctx);
   if (!step) return;
 
+  // If it's a button/scale/multiselect step, ignore plain text
   if (step.type !== 'text') {
     return ctx.reply("Please use the buttons above to answer this one!");
   }
 
+  // Prevent hammering the LLM while waiting
   if (ctx.session.waitingForLLM) return;
   ctx.session.waitingForLLM = true;
 
@@ -168,17 +173,32 @@ bot.on('message:text', async (ctx) => {
       nextQuestion: nextStepQuestion(ctx),
     });
 
-    await ctx.reply(result.reply);
-
     if (result.advance) {
       ctx.session.data[step.key] = result.extractedValue;
-      await advance(ctx);
+      // advance first so we know the next step type
+      ctx.session.step++;
+      const nextStep = STEPS[ctx.session.step];
+      // send LLM reply (already contains next question for text steps)
+      await ctx.reply(result.reply, { parse_mode: 'Markdown' });
+      // only send next step separately if it needs buttons/keyboard (can't be embedded)
+      if (nextStep && nextStep.type !== 'text') {
+        if (ctx.session.step >= STEPS.length) {
+          await finish(ctx);
+        } else {
+          await sendStep(ctx, nextStep);
+        }
+      } else if (!nextStep) {
+        await finish(ctx);
+      }
+    } else {
+      await ctx.reply(result.reply);
     }
   } finally {
     ctx.session.waitingForLLM = false;
   }
 });
 
+// Photo uploads
 bot.on('message:photo', async (ctx) => {
   if (ctx.session.step < 0) return;
   const step = currentStep(ctx);
@@ -192,6 +212,7 @@ bot.on('message:photo', async (ctx) => {
   await advance(ctx);
 });
 
+// Catch-all for unsupported message types
 bot.on('message', async (ctx) => {
   if (!ctx.message.text && !ctx.message.photo) {
     await ctx.reply("I can only handle text and photos right now!");
