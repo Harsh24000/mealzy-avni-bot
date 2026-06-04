@@ -294,5 +294,10 @@ export function createOptionsKeyboard(fieldKey, options) {
     keyboard.text(opt, `ans_${fieldKey}_${idx}`);
     if (idx % 2 === 1) keyboard.row(); // 2 buttons per row
   });
+  
+  // Ensure the Undo button is on a new row
+  if (options.length % 2 !== 0) keyboard.row();
+  keyboard.text("↩️ Undo Last Question", "undo");
+
   return keyboard;
 }
