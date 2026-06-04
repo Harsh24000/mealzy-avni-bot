@@ -30,8 +30,7 @@ function nextStepQuestion(ctx) {
 }
 
 async function sendStep(ctx, step) {
-  const sectionHeader = `_${step.section}_\n\n`;
-  const text = sectionHeader + step.question;
+  const text = step.question;
   const opts = { parse_mode: 'Markdown' };
 
   if (step.type === 'text' || step.type === 'photo') {
