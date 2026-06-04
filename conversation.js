@@ -1,4 +1,7 @@
 import SECTIONS from "./sections.js";
+import fs from "fs";
+import path from "path";
+import os from "os";
 import {
   SYSTEM_PROMPT,
   EXTRACTION_PROMPT,
@@ -14,6 +17,7 @@ import {
   generateTransition,
   generateWelcome,
   generateSummary,
+  transcribeAudio,
 } from "./llm.js";
 import {
   simulateTyping,
@@ -22,6 +26,7 @@ import {
   fillTemplate,
   formatSummaryForTelegram,
   delay,
+  createOptionsKeyboard,
 } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -436,7 +441,12 @@ export async function handleMessage(ctx) {
     }
   }
 
-  await sendBotMessage(ctx, state, response);
+  let keyboard = null;
+  if (currentMissing.length > 0 && currentMissing[0].options && currentMissing[0].options.length <= 12) {
+    keyboard = createOptionsKeyboard(currentMissing[0].key, currentMissing[0].options);
+  }
+
+  await sendBotMessage(ctx, state, response, keyboard);
 }
 
 /**
@@ -644,18 +654,108 @@ async function handleReviewResponse(ctx, state, userMessage) {
 // Utility: send a message and track in history
 // ---------------------------------------------------------------------------
 
-async function sendBotMessage(ctx, state, text) {
+async function sendBotMessage(ctx, state, text, keyboard = null) {
   const messages = splitMessages(text, 4000);
 
   for (let i = 0; i < messages.length; i++) {
     if (i > 0) {
       await simulateTyping(ctx, calculateTypingDelay(messages[i]));
     }
-    await ctx.reply(messages[i]);
+    const options = { parse_mode: "HTML" };
+    // Only attach keyboard to the very last message chunk
+    if (keyboard && i === messages.length - 1) {
+      options.reply_markup = keyboard;
+    }
+    try {
+      await ctx.reply(messages[i], options);
+    } catch {
+      await ctx.reply(messages[i]);
+    }
     if (i < messages.length - 1) {
       await delay(400);
     }
   }
 
   addToHistory(state, "Bot", text);
+}
+
+// ---------------------------------------------------------------------------
+// PM Features: Voice & Callbacks
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle incoming voice notes
+ */
+export async function handleVoice(ctx) {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  if (state.completed) {
+    await ctx.reply("You've already completed the onboarding! 🎉");
+    return;
+  }
+  
+  await ctx.api.sendChatAction(chatId, "typing");
+  
+  try {
+    const file = await ctx.getFile();
+    const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+    
+    const tmpPath = path.join(os.tmpdir(), `voice_${chatId}_${Date.now()}.ogg`);
+    fs.writeFileSync(tmpPath, Buffer.from(buffer));
+    
+    await simulateTyping(ctx, 1000);
+    const text = await transcribeAudio(tmpPath);
+    fs.unlinkSync(tmpPath);
+    
+    await ctx.reply(`<i>🎙 Transcribed: "${text}"</i>`, { parse_mode: "HTML" });
+    
+    ctx.message = { text, chat: ctx.chat };
+    await handleMessage(ctx);
+  } catch (err) {
+    console.error("[Voice] Error processing voice note:", err);
+    await ctx.reply("Sorry, I had trouble processing that voice note. Could you type it out instead?");
+  }
+}
+
+/**
+ * Handle inline keyboard button clicks
+ */
+export async function handleCallbackQuery(ctx) {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !data.startsWith("ans_")) return;
+  
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  if (state.completed) {
+    await ctx.answerCallbackQuery({ text: "You've already finished onboarding!" });
+    return;
+  }
+  
+  const parts = data.split("_");
+  const idx = parseInt(parts.pop(), 10);
+  const fieldKey = parts.slice(1).join("_");
+  
+  let field = null;
+  for (const sec of SECTIONS) {
+    const f = sec.fields.find(x => x.key === fieldKey);
+    if (f) {
+      field = f;
+      break;
+    }
+  }
+  
+  if (field && field.options && field.options[idx]) {
+    const answer = field.options[idx];
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    await ctx.reply(`👉 ${answer}`);
+    
+    ctx.message = { text: answer, chat: ctx.chat };
+    await handleMessage(ctx);
+  } else {
+    await ctx.answerCallbackQuery({ text: "Invalid option." });
+  }
 }
