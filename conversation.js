@@ -282,11 +282,17 @@ export async function handleStatus(ctx) {
  * Handle an incoming text message during onboarding.
  */
 export async function handleMessage(ctx) {
+  const userMessage = ctx.message?.text?.trim();
+  if (!userMessage) return;
+  await processUserMessage(ctx, userMessage);
+}
+
+/**
+ * Core logic for processing a user's text input
+ */
+export async function processUserMessage(ctx, userMessage) {
   const chatId = ctx.chat.id;
   const state = getState(chatId);
-  const userMessage = ctx.message?.text?.trim();
-
-  if (!userMessage) return;
 
   // If completed, tell them
   if (state.completed) {
@@ -753,8 +759,7 @@ export async function handleCallbackQuery(ctx) {
     await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
     await ctx.reply(`👉 ${answer}`);
     
-    ctx.message = { text: answer, chat: ctx.chat };
-    await handleMessage(ctx);
+    await processUserMessage(ctx, answer);
   } else {
     await ctx.answerCallbackQuery({ text: "Invalid option." });
   }
