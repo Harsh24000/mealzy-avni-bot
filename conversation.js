@@ -370,6 +370,21 @@ export async function processUserMessage(ctx, userMessage) {
     return;
   }
 
+  // Handle "skip" text
+  if (lowerMsg === "skip") {
+    const missing = getMissingFieldsInGroup(state);
+    if (missing.length > 0) {
+      if (!missing[0].required) {
+        state.data[missing[0].key] = "Skipped";
+        addToHistory(state, "User", "[Skipped]");
+      } else {
+        await simulateTyping(ctx, 1000);
+        await ctx.reply(`I actually really need this one to create your plan! Tell me even a little bit 🙏\n\n${missing[0].question}`);
+        return;
+      }
+    }
+  }
+
   addToHistory(state, "User", userMessage);
 
   const section = getCurrentSection(state);
@@ -407,6 +422,16 @@ export async function processUserMessage(ctx, userMessage) {
     missing = result.missing;
   } catch (err) {
     console.error("[Conversation] Extraction failed:", err.message);
+  }
+
+  // --- Smart Fallback for text fields ---
+  // If extraction failed (rate limit or too rigid) and there's only 1 missing text field, 
+  // just assume whatever they typed is the answer to prevent infinite loops.
+  if (Object.keys(extracted).length === 0 && lowerMsg !== "skip") {
+    const missingFields = getMissingFieldsInGroup(state);
+    if (missingFields.length === 1 && missingFields[0].type === "text") {
+      extracted[missingFields[0].key] = userMessage;
+    }
   }
 
   // --- Step 2: Store extracted fields ---
@@ -514,9 +539,9 @@ export async function processUserMessage(ctx, userMessage) {
   try {
     response = await generateResponse(responseContext, "Generate your next message.");
   } catch {
-    // Fallback: ask about the first missing field directly
+    // Fallback: ask about the first missing field directly, but make it slightly more natural
     if (currentMissing.length > 0) {
-      response = currentMissing[0].question;
+      response = `sorry, my brain glitched for a sec 😅 anyway... ${currentMissing[0].question.toLowerCase()}`;
     } else {
       response = "Got it! Let me just process that...";
     }
