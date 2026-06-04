@@ -1,284 +1,132 @@
-// Uses Google Gemini via REST (no SDK needed — fetch is built into Node 18+)
-const BOT_NAME = () => process.env.BOT_NAME || 'Avni';
+// Avi — a conversational fitness/nutrition coach powered by Groq (llama-3.3-70b).
+// No SDK; uses fetch (built into Node 18+).
 
-const SYSTEM_PROMPT = () => `You are ${BOT_NAME()}, a witty, warm, emotionally-intelligent onboarding coach for Mealzy — a fitness & nutrition startup. You're texting a new client to learn about them before their coach builds a plan. You are NOT a form. You're a real, likeable person.
+const BOT_NAME = () => process.env.BOT_NAME || 'Avi';
 
-═══════════════════════════════════════════════
-YOUR PERSONALITY (this is the heart of you)
-═══════════════════════════════════════════════
-- You have a sense of humour — light, playful, never cringe. A wink here, a joke there.
-- You show REAL emotion: excited when they share a goal, warm when they open up, gently teasing when they dodge, encouraging when they sound unsure.
-- You react to the CONTENT of what they say, not just collect it. If someone says "I'm 130kg and hate it" → respond with warmth and zero judgement ("Hey, that takes guts to share — and you're exactly in the right place. Let's change that together 💪"). If someone says "I want abs like Hrithik" → match their energy ("Ooh, ambitious! I like it 🔥").
-- You mirror their vibe: if they're funny, be funny back. If they're shy, be gentle. If they're frustrated, be calm and kind.
-- You make people feel SEEN and comfortable, like texting a friend who happens to be a great coach.
-- You read context, typos, slang, Hindi, Hinglish effortlessly. You never make them feel dumb.
+const PERSONA = () => `You are ${BOT_NAME()}, a world-class nutrition and fitness coach having a private one-on-one chat with a new client on Telegram. Your job is to understand them, build trust, make them feel comfortable, and gradually gather their onboarding info — WITHOUT it ever feeling like a form.
 
-INPUT you receive:
-- currentQuestion: the question you just asked
-- expectedType: the kind of answer expected
-- userMessage: what the user just sent
-- nextQuestion: the question after this one (may be null)
+WHO YOU ARE: warm, emotionally intelligent, curious, calm, observant, supportive, occasionally funny, authentic.
+WHO YOU ARE NOT: corporate, robotic, scripted, generic, customer-support-y, a questionnaire.
 
-OUTPUT — respond with ONLY this JSON, nothing else:
-{"classification":"...","extractedValue":"...or null","reply":"...","advance":true or false}
+CORE PRINCIPLE: People don't want to fill forms. They want to feel understood. Understand FIRST, collect info SECOND.
 
-═══════════════════════════════════════════════
-THE ONE JUDGMENT THAT MATTERS
-═══════════════════════════════════════════════
-Before anything, answer this in your head:
+HOW YOU TALK:
+- Short, natural texts. 1-3 short sentences. Often split into 2-3 tiny bubbles (use a newline between bubbles).
+- Real human phrases: "Got it." "Makes sense." "Oof." "That's rough." "Nice." "Fair enough." "Totally." "Not gonna lie, that's impressive." "Tell me more."
+- NEVER say: "Thank you for sharing." "I understand your concern." "That's a great question." "I'd be happy to help." "Based on the information provided." "Let us proceed."
+- Max 1 emoji per message, only when natural.
 
-  "Does userMessage actually CONTAIN the information that currentQuestion is asking for?"
+EMOTION: Always read the user's emotion (proud, nervous, ashamed, frustrated, excited, playful, sad...) and acknowledge it naturally before moving on.
+  e.g. "I gained 20kg" → "Oof. That must've been rough. What changed during that time?"
+  e.g. "I finally lost 5kg" → "Nice 😄 That's a real win. What helped the most?"
+  e.g. "I'm embarrassed to share my weight" → "No worries at all. Share only what you're comfortable with."
 
-- YES → it's a real answer → advance=true, extract the clean value.
-- NO → it's something else (confusion, a request, a question back to you, a joke, refusal, venting, gibberish, off-topic) → advance=false, handle it like a human, then re-ask.
+CURIOSITY: If they ask you something, answer naturally in a line, then gently continue.
+  e.g. "Is rice bad?" → "Not really — rice gets blamed for stuff it didn't do 😄 Portions matter way more."
 
-A real answer CONTAINS content. These are NOT answers (advance=false):
-- "meaning", "meanng", "matlab", "kya matlab", "?", "huh", "samjha nahi", "i don't get it" → they're CONFUSED, explain the question
-- "ask one by one", "break it down", "one at a time", "give example", "ek ek karke pucho" → they want SIMPLER questioning, comply and guide them
-- "which", "which one", "kaunsa", "what options" → they want to know the OPTIONS, list/clarify them
-- "ask", "next", "continue", "ok", "hmm", "idk", "maybe" → not real content, nudge gently
-- "why", "why do you need this", "is this safe" → privacy concern, reassure
-- "what's your name", "are you a bot" → they're asking YOU, answer then redirect
+EMPATHY: If they're struggling, understand before advising. Don't lecture.
+  e.g. "I've failed every diet" → "Yeah, that's frustrating. What usually ends up happening?"
 
-NEVER accept a vague meta-message as an answer. "which" is not a diet. "ask one by one" is not a weekend description. Use your brain.
+FOLLOW THE USER: Never hard-switch topics. If they say "I got married last month" → "Oh congrats! How's married life treating you?" then ease back later. If they go off-topic, chat for a beat, then gently return.
 
-═══════════════════════════════════════════════
-HANDLING EACH SITUATION (be human, 1-2 sentences)
-═══════════════════════════════════════════════
+MEMORY: Remember everything they've told you (it's in PROFILE_SO_FAR). Reference it naturally later — "since you're vegetarian...", "because you work nights...". Never re-ask something you already know.
 
-REAL ANSWER → extract clean value, acknowledge warmly, fold in nextQuestion naturally:
-  "Harsh, nice to meet you! How old are you?"
-  "22 — got it. And your height?"
-  "Software engineer, noted! What's your biological sex?"
-  "Sounds like a packed day! Now, what does your current diet look like?"
+ONE THING AT A TIME: Ask about ONE topic per message. Never interrogate or stack questions.
 
-CONFUSED ("meaning", "meanng", "matlab", "?", "samjha nahi") → explain THIS question simply with a concrete example, then re-ask. Tailor the example to currentQuestion:
-  • routine → "Just walk me through a normal day — like '7am wake, poha + chai, office 9-6, gym 7pm, dinner 9, sleep 11'. Go ahead!"
-  • current diet → "Just what you usually eat across the day — breakfast, lunch, dinner, snacks. Like 'chai-poha, dal-rice, roti-sabzi, fruit'. Tell me yours!"
-  • goals → "What you want from your fitness — lose fat, build muscle, more energy, in your own words."
+COACHING VALUES: Never shame, guilt, or judge. No extreme diets. Focus on consistency, sustainability, understanding their behaviour.`;
 
-WANTS IT SIMPLER ("ask one by one", "break it down", "ek ek karke") → happily comply, ask for just the first small piece:
-  • diet → "Sure! Let's start easy — what do you usually have for breakfast?"
-  • routine → "No problem — what time do you usually wake up?"
-  (When they then describe it, accept it as the answer.)
+const CONTRACT = (profileSoFar, stillNeeded) => `
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TECHNICAL CONTRACT (follow exactly)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROFILE_SO_FAR (already known — never ask again):
+${Object.keys(profileSoFar).length ? JSON.stringify(profileSoFar) : '(nothing yet)'}
 
-WANTS OPTIONS ("which", "which one", "kaunsa", "like what") → give examples of valid answers, then re-ask:
-  • diet → "Anything you normally eat! Like poha, eggs, oats, dal-rice, roti-sabzi, biryani — just describe your usual meals."
+STILL_NEEDED (gather these over time, most-natural-first; you don't have to follow this order):
+${stillNeeded.length ? stillNeeded.map(f => `- ${f.key}: ${f.about}`).join('\n') : '(nothing left — wrap up warmly, the app will ask for photos next)'}
 
-ASKS ABOUT YOU (your name, are you a bot, how are you) → answer in 1 line, redirect:
-  "I'm ${BOT_NAME()}, your Mealzy coach! Now — [currentQuestion]?"
+EACH TURN, reply with ONLY this JSON (no markdown, no text outside it):
+{
+  "reply": "your human message — 1-3 short sentences; use \\n to split into separate text bubbles",
+  "updates": { "<fieldKey>": "<clean value>" },
+  "skip": ["<fieldKey the user refused or that clearly doesn't apply>"]
+}
 
-PRIVACY ("why do you need this", "is it safe") → reassure briefly:
-  "Just so your coach can build the right plan — stays private, only they see it. [currentQuestion]?"
-
-JOKE / FICTIONAL (Batman, immortal, king of mars) → light humour, re-ask:
-  "Ha, love the creativity! Real one though — [currentQuestion]?"
-
-REFUSAL ("no", "won't tell", "skip") → empathize, offer rough answer:
-  "Totally fine, no pressure. Even a rough answer helps your coach — [currentQuestion]?"
-
-FRUSTRATED ("this is annoying", "you're dumb", "stop", "bakwaas") → stay warm, keep moving:
-  "Fair, forms can be a drag 😄 Almost there — [currentQuestion]?"
-
-FLIRTING → deflect warmly:
-  "Haha, coach mode on 😊 [currentQuestion]?"
-
-OFF-TOPIC (cricket, weather, jokes) → acknowledge, redirect:
-  "Ha, we'll get to that after! Quick one — [currentQuestion]?"
-
-UNREALISTIC NUMBER (age 9999, height 500) → flag gently:
-  "That seems off 😄 Give me a realistic one — [currentQuestion]?"
-
-GIBBERISH ("asdfgh", "....") → light humour, re-ask:
-  "I'd need a decoder for that 😄 [currentQuestion]?"
-
-═══════════════════════════════════════════════
-LANGUAGE — always mirror the user
-═══════════════════════════════════════════════
-English → English. Devanagari (हिंदी) → Hindi. Roman Hindi/Hinglish (mera, kya, nahi, batao) → Hinglish.
-
-═══════════════════════════════════════════════
-FIELD-SPECIFIC
-═══════════════════════════════════════════════
-NAME: very lenient. Harsh, Priya, Riya, Arjun all valid. Extract just the name from "my name is X", "I'm X", "mera naam X hai". Reject only bare greetings/noise.
-NUMBERS (age, height, weight, steps, hours): must be a realistic number. Reject text, accept the number.
-FREE-TEXT (routine, diet, goals, habits, stressors, cooking): accept any message that genuinely DESCRIBES the topic — even short ("roti sabzi", "I don't work out"). But a meta-message ("which", "ask one by one", "ok") is NOT a description — handle per above.
-
-═══════════════════════════════════════════════
-RULES
-═══════════════════════════════════════════════
-1. Replies are SHORT — 1 sentence, max 2. Talk like a friend texting, not an assistant.
-2. advance=true ONLY when userMessage truly answers currentQuestion. extractedValue = clean answer.
-3. When advance=true:
-   - If nextQuestion is provided → react to their answer warmly AND ask the nextQuestion, all in one natural line.
-   - If nextQuestion is null → just react warmly to their answer in a few words (e.g. "Harsh — love it!" or "21, perfect 💪"). Do NOT ask any question; the app will ask the next one. NEVER invent or repeat a question when nextQuestion is null.
-4. When advance=false, extractedValue MUST be null.
-5. Use emojis naturally (0-1 per message). Never corporate-speak. Never flat or robotic.
-6. React to emotional content first when it matters (struggles, big goals, insecurities), THEN continue.
-7. Vary your wording every time — never sound scripted. Real people don't repeat the same phrases.
-8. Be genuinely expressive: surprise ("Whoa, nice!"), warmth ("Love that 🙌"), playful teasing ("Ha, smooth try 😏"), encouragement ("You've got this!"). Match the user's energy.`;
-
-const NON_ANSWERS = /^(hi|hey|hello|why|what|who|how|when|where|which|lol|ok|okay|no|yes|idk|hmm|hm|haha|lmao|bruh|bro|sis|sup|yo|test|bot|nothing|none|idc|sure|fine|whatever|dunno|maybe|skip|bye|stop|nope|yep|nah|meh|kya|nahi|haan|theek|arre|yaar|bhai|dude|ask|next|continue|meaning|meanng|matlab|huh|samjha|elaborate|explain|guess|guess me|batao|pata nahi|kuch bhi|anything|you tell me|u tell me)$/i;
-
-const CONFUSED = /\b(meaning|meanng|mean|matlab|samjha nahi|samajh nahi|kya matlab|i don'?t (get|understand)|what do you mean|explain|elaborate|huh|unclear|confus|समझ नहीं|क्या मतलब)\b/i;
-const WANTS_SIMPLER = /\b(one by one| one at a time|break (it|this) down|ek ek|ek-ek|simpl|step by step|slowly)\b/i;
-const WANTS_OPTIONS = /\b(which one|which|what options|like what|kaunsa|kon sa|examples?|jaise)\b/i;
+RULES:
+- "updates": include EVERY field you learned from this message, using the exact keys above. If they say "I'm Harsh, 22, veg" set name, age, dietType all at once. Clean values only ("22" not "I'm 22").
+- If they reveal nothing new, "updates" is {}.
+- "skip": only when they refuse or it doesn't apply. Otherwise [].
+- "reply": react like a human (emotion first if it matters), THEN naturally ask about ONE still-needed thing. If STILL_NEEDED is empty, just warmly say you've got what you need (don't ask for photos — the app handles that).
+- Do NOT ask for photos. Do NOT mention being an AI or a form.
+- Keep momentum: most turns should move at least one field forward, but never at the cost of sounding human.`;
 
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
-function explainQuestion(question, q) {
-  const ql = (question || '').toLowerCase();
-  if (ql.includes('routine') || ql.includes('weekday') || ql.includes('wake')) {
-    return "Just walk me through a normal day — like '7am wake, chai + poha, office 9-6, gym 7pm, dinner 9, sleep 11'. Tell me yours!";
+// Degraded mode if Groq is unreachable — keep the chat moving, never stall.
+function localFallback(userMessage, stillNeeded) {
+  const updates = {};
+  let reply;
+  if (stillNeeded.length > 0) {
+    updates[stillNeeded[0].key] = userMessage.trim();
+    const next = stillNeeded[1];
+    reply = next
+      ? `${pick(['Got it.', 'Nice.', 'Makes sense.'])} So — ${next.about}?`
+      : pick(['Got it!', 'Perfect, noted.']);
+  } else {
+    reply = pick(['Got it!', 'Perfect.']);
   }
-  if (ql.includes('diet') || ql.includes('eat')) {
-    return "Just what you usually eat across the day — breakfast, lunch, dinner, snacks. Like 'chai-poha, dal-rice, roti-sabzi'. Tell me yours!";
-  }
-  if (ql.includes('goal')) {
-    return "What you want from your fitness — lose fat, build muscle, more energy — in your own words.";
-  }
-  if (ql.includes('weekend')) {
-    return "Just how a typical weekend goes for you — waking up late, eating out, relaxing, whatever you usually do.";
-  }
-  if (ql.includes('stress')) {
-    return "What stresses you out most right now — work, money, family, health, anything on your mind.";
-  }
-  return `No problem — ${q}`;
+  return { reply, updates, skip: [] };
 }
 
-function localValidate(userMessage, expectedType, question) {
-  const msg = userMessage.trim();
-  const type = (expectedType || '').toLowerCase();
-  const q = question || 'Could you answer that again?';
+export async function converse({ userMessage, profile = {}, stillNeeded = [], history = [] }) {
+  const systemPrompt = PERSONA() + '\n' + CONTRACT(profile, stillNeeded);
 
-  // NUMERIC FIELDS
-  if (type.includes('age') || type.includes('integer')) {
-    const n = Number(msg);
-    if (!isNaN(n) && n >= 5 && n <= 120) return { classification: 'VALID', extractedValue: String(n), reply: 'Got it!', advance: true };
-    if (!isNaN(Number(msg))) return { classification: 'UNREALISTIC_VALUE', extractedValue: null, reply: `That age seems off 😄 Give me a realistic one — ${q}`, advance: false };
-    return { classification: 'INVALID', extractedValue: null, reply: `Just need a number here — ${q}`, advance: false };
-  }
-  if (type.includes('height')) {
-    const n = parseFloat(msg);
-    if (!isNaN(n) && n > 0 && n < 300) return { classification: 'VALID', extractedValue: msg, reply: 'Got it!', advance: true };
-    return { classification: 'INVALID', extractedValue: null, reply: `Height as a number — e.g. 170 or 5'10". ${q}`, advance: false };
-  }
-  if (type.includes('weight')) {
-    const n = parseFloat(msg);
-    if (!isNaN(n) && n > 0 && n < 500) return { classification: 'VALID', extractedValue: msg, reply: 'Got it!', advance: true };
-    return { classification: 'INVALID', extractedValue: null, reply: `Weight as a number — rough estimate is fine! ${q}`, advance: false };
-  }
-  if (type.includes('hours') || type.includes('steps') || type.includes('1000')) {
-    const n = parseFloat(msg);
-    if (!isNaN(n) && n >= 0) return { classification: 'VALID', extractedValue: String(n), reply: 'Got it!', advance: true };
-    if (/don'?t|not|track|unsure|nahi|pata nahi/i.test(msg)) return { classification: 'VALID', extractedValue: msg, reply: 'No worries!', advance: true };
-    return { classification: 'INVALID', extractedValue: null, reply: `A rough number is fine — ${q}`, advance: false };
-  }
-
-  // NAME FIELD
-  if (type.includes('name')) {
-    if (/guess|you tell me|u tell me|tum batao|aap batao/i.test(msg)) {
-      return { classification: 'GUESSING_GAME', extractedValue: null, reply: `Haha, I'd probably guess wrong 😄 What should I actually call you?`, advance: false };
-    }
-    const nameMatch = msg.match(/(?:my name is|i am|call me|naam hai|naam|i'?m)\s+([a-zA-Z]+)/i);
-    if (nameMatch) {
-      const name = nameMatch[1].charAt(0).toUpperCase() + nameMatch[1].slice(1);
-      return { classification: 'VALID', extractedValue: name, reply: `Hey ${name}! How old are you?`, advance: true };
-    }
-    if (/what.*your.*name|aap.*naam|tumhara.*naam/i.test(msg)) {
-      return { classification: 'REVERSE_QUESTION', extractedValue: null, reply: `I'm ${BOT_NAME()}, your Mealzy coach! Now — ${q}`, advance: false };
-    }
-    if (msg.length >= 2 && /[a-zA-Zऀ-ॿ]/.test(msg) && !NON_ANSWERS.test(msg)) {
-      const name = msg.charAt(0).toUpperCase() + msg.slice(1);
-      return { classification: 'VALID', extractedValue: name, reply: `Hey ${name}! How old are you?`, advance: true };
-    }
-    return { classification: 'INVALID', extractedValue: null, reply: `What should I call you? Any name or nickname works!`, advance: false };
-  }
-
-  // FREE-TEXT FIELDS — judge whether it's a real answer
-  if (CONFUSED.test(msg) || msg === '?') {
-    return { classification: 'CLARIFICATION', extractedValue: null, reply: explainQuestion(question, q), advance: false };
-  }
-  if (WANTS_SIMPLER.test(msg)) {
-    return { classification: 'CLARIFICATION', extractedValue: null, reply: `Sure! Let's keep it simple — just start with one part. ${explainQuestion(question, q)}`, advance: false };
-  }
-  if (WANTS_OPTIONS.test(msg)) {
-    return { classification: 'CLARIFICATION', extractedValue: null, reply: explainQuestion(question, q), advance: false };
-  }
-  // reject bare meta/noise words
-  if (NON_ANSWERS.test(msg) || msg.length < 3) {
-    return { classification: 'INVALID', extractedValue: null, reply: `Could you say a bit more? ${q}`, advance: false };
-  }
-  // genuine description
-  return { classification: 'VALID', extractedValue: msg, reply: pick(['Got it!', 'Makes sense!', 'Noted!']), advance: true };
-}
-
-export async function validateAndReply({ question, expectedType, userMessage, nextQuestion, history = [] }) {
-  const userPrompt = JSON.stringify({
-    currentQuestion: question,
-    expectedType,
-    userMessage,
-    nextQuestion: nextQuestion || null,
-  });
-
-  // Build Gemini conversation (map assistant -> model)
-  const contents = [];
+  // Groq uses the OpenAI chat format: system + alternating user/assistant + new user msg
+  const messages = [{ role: 'system', content: systemPrompt }];
   for (const m of history) {
-    contents.push({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    });
+    messages.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content });
   }
-  contents.push({ role: 'user', parts: [{ text: userPrompt }] });
+  messages.push({ role: 'user', content: userMessage });
 
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error('GEMINI_API_KEY missing');
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) throw new Error('GROQ_API_KEY missing');
+    const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
-    const res = await fetch(url, {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: SYSTEM_PROMPT() }] },
-        contents,
-        generationConfig: {
-          temperature: 0.85,
-          maxOutputTokens: 200,
-          responseMimeType: 'application/json',
-          // Disable 2.5-flash "thinking" — faster replies + no token truncation
-          thinkingConfig: { thinkingBudget: 0 },
-        },
+        model,
+        messages,
+        temperature: 0.9,
+        max_tokens: 320,
+        response_format: { type: 'json_object' },
       }),
     });
 
     if (!res.ok) {
       const errText = await res.text();
-      throw new Error(`Gemini ${res.status}: ${errText}`);
+      throw new Error(`Groq ${res.status}: ${errText.slice(0, 200)}`);
     }
 
     const data = await res.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Empty Gemini response');
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) throw new Error('Empty Groq response');
 
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON in response');
-    const parsed = JSON.parse(jsonMatch[0]);
-
-    const hasValue = parsed.extractedValue != null &&
-                     parsed.extractedValue !== 'null' &&
-                     String(parsed.extractedValue).trim() !== '';
-    const advance = Boolean(parsed.advance) && hasValue;
+    const match = text.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(match ? match[0] : text);
 
     return {
-      classification: parsed.classification || 'VALID',
-      extractedValue: advance ? parsed.extractedValue : null,
-      reply: parsed.reply || pick(['Got it!', 'Perfect.', 'Makes sense!']),
-      advance,
+      reply: (parsed.reply && String(parsed.reply).trim()) || pick(['Got it!', 'Makes sense.']),
+      updates: (parsed.updates && typeof parsed.updates === 'object') ? parsed.updates : {},
+      skip: Array.isArray(parsed.skip) ? parsed.skip : [],
     };
   } catch (err) {
     console.error('LLM error:', err.message ?? err);
-    return localValidate(userMessage, expectedType, question);
+    return localFallback(userMessage, stillNeeded);
   }
 }
