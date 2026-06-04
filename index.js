@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Bot } from 'grammy';
-import { handleStart, handleRestart, handleStatus, handleMessage, handlePhoto } from './conversation.js';
+import { handleStart, handleRestart, handleStatus, handleMessage, handlePhoto, handleVoice, handleCallbackQuery } from './conversation.js';
 
 // Validate environment variables
 if (!process.env.TELEGRAM_BOT_TOKEN) {
@@ -35,10 +35,16 @@ bot.on('message:text', handleMessage);
 // Handle photo messages
 bot.on('message:photo', handlePhoto);
 
+// Handle voice messages
+bot.on('message:voice', handleVoice);
+
+// Handle callback queries
+bot.on('callback_query:data', handleCallbackQuery);
+
 // Handle other types of messages gracefully
 bot.on('message', async (ctx) => {
-  if (!ctx.message.text && !ctx.message.photo) {
-    await ctx.reply("I can only process text and photos right now. 😊");
+  if (!ctx.message.text && !ctx.message.photo && !ctx.message.voice) {
+    await ctx.reply("I can only process text, voice notes, and photos right now. 😊");
   }
 });
 
