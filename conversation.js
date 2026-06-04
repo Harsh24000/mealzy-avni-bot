@@ -29,8 +29,6 @@ import {
   createOptionsKeyboard,
   createSkipKeyboard,
   buildProgressBar,
-  localExtract,
-  localResponse,
 } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -437,29 +435,19 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
   let extracted = {};
   let missing = [];
 
-  // Try local (zero-API) extraction first for simple field types
-  // This eliminates Groq rate limit errors for most messages
-  const { extracted: localResult, needsLLM } = localExtract(userMessage, currentGroup);
+  const extractionContext = [
+    `Current section: ${section.name}`,
+    `Fields to extract:\n${buildFieldDefinitions(fieldsForExtraction)}`,
+    `Already collected: ${buildCollectedData(state, fieldsForExtraction)}`,
+    `User message: ${userMessage}`,
+  ].join("\n\n");
 
-  if (Object.keys(localResult).length > 0) {
-    console.log(`[LocalExtract] Extracted without LLM:`, localResult);
-    extracted = localResult;
-  } else if (needsLLM || currentGroup.some(f => f.type === 'multiselect')) {
-    // Fall back to Groq for complex/multi-field groups
-    const extractionContext = [
-      `Current section: ${section.name}`,
-      `Fields to extract:\n${buildFieldDefinitions(fieldsForExtraction)}`,
-      `Already collected: ${buildCollectedData(state, fieldsForExtraction)}`,
-      `User message: ${userMessage}`,
-    ].join("\n\n");
-
-    try {
-      const result = await extractFields(EXTRACTION_PROMPT, extractionContext);
-      extracted = result.extracted;
-      missing = result.missing;
-    } catch (err) {
-      console.error("[Conversation] Extraction failed:", err.message);
-    }
+  try {
+    const result = await extractFields(EXTRACTION_PROMPT, extractionContext);
+    extracted = result.extracted;
+    missing = result.missing;
+  } catch (err) {
+    console.error("[Conversation] Extraction failed:", err.message);
   }
 
   // Final safety net: if everything failed and there's a single open-ended field,
@@ -577,51 +565,37 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
     keyboard = createSkipKeyboard();
   }
 
-  // Try local response first (zero API calls) — only use Groq for complex cases
-  const userName = state.data.fullName || null;
-  const localMsg = localResponse(userName, extracted, currentMissing, state.data);
-
   let response;
-  if (localMsg && !keyboard) {
-    // Perfect — we have a human-sounding local response, no Groq needed
-    console.log(`[LocalResponse] Responding without LLM: "${localMsg}"`);
-    response = localMsg;
-  } else {
-    // Use Groq for complex sections (food preferences, goals, stress, etc.)
-    const responseContext = fillTemplate(RESPONSE_PROMPT, {
-      botName: BOT_NAME,
-      sectionName: section.name,
-      sectionDescription: section.description,
-      extractedFields: JSON.stringify(extracted),
-      missingFields: buildFieldDefinitions(currentMissing),
-      userProfile: buildUserProfile(state),
-      conversationHistory: buildConversationHistory(state),
-      currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute:'2-digit' })
-    });
 
-    await simulateTyping(ctx, calculateTypingDelay("response"));
+  const responseContext = fillTemplate(RESPONSE_PROMPT, {
+    botName: BOT_NAME,
+    sectionName: section.name,
+    sectionDescription: section.description,
+    extractedFields: JSON.stringify(extracted),
+    missingFields: buildFieldDefinitions(currentMissing),
+    userProfile: buildUserProfile(state),
+    conversationHistory: buildConversationHistory(state),
+    currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute:'2-digit' })
+  });
 
+  await simulateTyping(ctx, calculateTypingDelay("response"));
+
+  try {
+    response = await generateResponse(responseContext, "Generate your next message.");
+  } catch (err) {
+    console.error("[Response] generateResponse failed:", err.message);
+    // Retry once after 2s
     try {
+      await delay(2000);
       response = await generateResponse(responseContext, "Generate your next message.");
-    } catch (err) {
-      console.error("[Response] generateResponse failed:", err.message);
-      // Retry once after 2s
-      try {
-        await delay(2000);
-        response = await generateResponse(responseContext, "Generate your next message.");
-      } catch {
-        // Final fallback — human-sounding, never robotic
-        const fallbacks = [
-          "sorry give me a sec...",
-          "hmm one moment",
-          "hang on...",
-        ];
-        response = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-        if (currentMissing.length > 0 && !currentMissing[0].options) {
-          const q = currentMissing[0].question.toLowerCase().replace(/[?.!]$/, '');
-          response = `${response} so — ${q}?`;
-        }
-      }
+    } catch {
+      // Final fallback — human-sounding, never robotic
+      const fallbacks = [
+        "sorry my internet just glitched, could you repeat that? 😅",
+        "wait sorry I missed that, telegram is acting up — what did you say?",
+        "sorry give me a sec, my connection just dropped... what was that again?",
+      ];
+      response = fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
   }
 
