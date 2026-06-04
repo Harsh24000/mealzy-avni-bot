@@ -718,8 +718,7 @@ export async function handleVoice(ctx) {
     
     await ctx.reply(`<i>🎙 Transcribed: "${text}"</i>`, { parse_mode: "HTML" });
     
-    ctx.message = { text, chat: ctx.chat };
-    await handleMessage(ctx);
+    await processUserMessage(ctx, text);
   } catch (err) {
     console.error("[Voice] Error processing voice note:", err);
     await ctx.reply("Sorry, I had trouble processing that voice note. Could you type it out instead?");
