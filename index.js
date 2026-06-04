@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Bot } from 'grammy';
-import { handleStart, handleRestart, handleStatus, handleMessage, handlePhoto, handleVoice, handleCallbackQuery } from './conversation.js';
+import { handleStart, handleRestart, handleStatus, handleMessage, handlePhoto, handleVoice, handleCallbackQuery, handleUndo } from './conversation.js';
 
 // Validate environment variables
 if (!process.env.TELEGRAM_BOT_TOKEN) {
@@ -28,6 +28,7 @@ bot.catch((err) => {
 bot.command('start', handleStart);
 bot.command('restart', handleRestart);
 bot.command('status', handleStatus);
+bot.command('undo', handleUndo);
 
 // Handle text messages
 bot.on('message:text', handleMessage);
