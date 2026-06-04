@@ -27,6 +27,8 @@ import {
   formatSummaryForTelegram,
   delay,
   createOptionsKeyboard,
+  createSkipKeyboard,
+  buildProgressBar,
 } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -229,6 +231,24 @@ export async function handleStart(ctx) {
   resetState(chatId);
   const state = getState(chatId);
 
+  // Premium branded welcome card
+  const totalSections = SECTIONS.filter(s => s.id !== 'review-submit').length;
+  const card = [
+    `🌿 <b>Welcome to Mealzy</b>`,
+    ``,
+    `India's most personalised nutrition & fitness coaching.`,
+    ``,
+    `────────────────────────`,
+    `📄 <b>Your Onboarding</b>`,
+    `${totalSections} sections · ~10–15 mins · 100% private`,
+    `────────────────────────`,
+    ``,
+    `⌨️ Type your answers &nbsp;·&nbsp; 🎙 Send voice notes &nbsp;·&nbsp; ↩️ /undo to go back`,
+  ].join('\n');
+
+  await ctx.reply(card, { parse_mode: 'HTML' });
+  await delay(800);
+
   // Generate welcome message via LLM
   const welcomePrompt = fillTemplate(WELCOME_PROMPT, { botName: BOT_NAME });
 
@@ -254,6 +274,22 @@ export async function handleRestart(ctx) {
 }
 
 /**
+ * Handle the /help command.
+ */
+export async function handleHelp(ctx) {
+  await ctx.reply(
+    `🤖 <b>Here's what you can do:</b>\n\n` +
+    `▶️ /start — Begin onboarding\n` +
+    `📊 /status — See your progress\n` +
+    `↩️ /undo — Undo your last answer\n` +
+    `🔄 /restart — Start over from scratch\n` +
+    `❓ /help — Show this menu\n\n` +
+    `You can also send a 🎙 <b>voice note</b> instead of typing any answer!`,
+    { parse_mode: "HTML" }
+  );
+}
+
+/**
  * Handle the /status command — show progress.
  */
 export async function handleStatus(ctx) {
@@ -261,21 +297,39 @@ export async function handleStatus(ctx) {
   const state = getState(chatId);
 
   if (state.completed) {
-    await ctx.reply("You've already completed the onboarding! 🎉\nType /restart if you want to start over.");
+    await ctx.reply(
+      `🎉 <b>Onboarding Complete!</b>\n\nYou've finished all sections. Your coach will be in touch within 24 hours.\n\nType /restart if you need to redo anything.`,
+      { parse_mode: 'HTML' }
+    );
     return;
   }
 
   const current = getCurrentSection(state);
-  const totalSections = SECTIONS.length - 1; // exclude review
-  const progress = Math.round((state.currentSectionIndex / totalSections) * 100);
+  const totalSections = SECTIONS.filter(s => s.id !== 'review-submit').length;
+  const completedCount = state.currentSectionIndex;
+  const progress = Math.round((completedCount / totalSections) * 100);
+  const progressBar = buildProgressBar(completedCount, totalSections);
+
+  const sectionIcons = [
+    '👤', '🥗', '🗓', '🏥', '💊', '😴', '🏋️', '🥘', '🎯', '❤️', '📸', '🚶', '✅'
+  ];
+
+  const sectionLines = SECTIONS
+    .filter(s => s.id !== 'review-submit')
+    .map((s, i) => {
+      const icon = sectionIcons[i] ?? '🔵';
+      if (i < completedCount) return `✅ <s>${s.name}</s>`;
+      if (i === completedCount) return `▶️ <b>${s.name}</b> ← you are here`;
+      return `⚪️ ${s.name}`;
+    }).join('\n');
 
   await ctx.reply(
-    `📊 *Your Progress*\n\n` +
-    `Currently on: *${current?.name ?? "Unknown"}*\n` +
-    `Section ${state.currentSectionIndex + 1} of ${totalSections}\n` +
-    `Progress: ${progress}%\n\n` +
-    `Keep going, you're doing great! 💪`,
-    { parse_mode: "Markdown" }
+    `📊 <b>Your Mealzy Progress</b>\n\n` +
+    `${progressBar} <b>${progress}%</b>\n` +
+    `Section ${completedCount} of ${totalSections} complete\n\n` +
+    `<b>Sections:</b>\n${sectionLines}\n\n` +
+    `💡 Tip: Send a voice note to answer faster!`,
+    { parse_mode: 'HTML' }
   );
 }
 
@@ -383,6 +437,25 @@ export async function processUserMessage(ctx, userMessage) {
       }
 
       if (advancement === "next-section") {
+        // 🎉 Section celebration + progress bar
+        const completedSection = section;
+        const totalSections = SECTIONS.filter(s => s.id !== 'review-submit').length;
+        const completedCount = state.currentSectionIndex; // already advanced
+        const progressPct = Math.round((completedCount / totalSections) * 100);
+        const progressBar = buildProgressBar(completedCount, totalSections);
+        
+        const celebrationLines = [
+          `✅ <b>${completedSection.name}</b> — done!`,
+          ``,
+          `${progressBar} ${progressPct}%`,
+          `Section ${completedCount} of ${totalSections} complete`,
+        ];
+        await delay(400);
+        try {
+          await ctx.reply(celebrationLines.join("\n"), { parse_mode: "HTML" });
+        } catch { /* non-critical */ }
+        await delay(600);
+
         // Generate transition message to next section
         const nextSection = getCurrentSection(state);
 
@@ -462,6 +535,9 @@ export async function processUserMessage(ctx, userMessage) {
   let keyboard = null;
   if (currentMissing.length > 0 && currentMissing[0].options && currentMissing[0].options.length <= 12) {
     keyboard = createOptionsKeyboard(currentMissing[0].key, currentMissing[0].options);
+  } else if (currentMissing.length > 0 && !currentMissing[0].required) {
+    // Optional question — add a Skip button
+    keyboard = createSkipKeyboard();
   }
 
   await sendBotMessage(ctx, state, response, keyboard);
@@ -611,12 +687,23 @@ async function handleReviewResponse(ctx, state, userMessage) {
     state.completed = true;
 
     await simulateTyping(ctx, 1200);
+
+    // Premium completion experience
+    const firstName = (state.data.fullName || "").split(" ")[0] || "";
     await ctx.reply(
-      `You're all set! 🎉\n\n` +
-      `Thanks for taking the time to chat with me, ${state.data.fullName || ""}! ` +
-      `Your coach will review everything and get back to you soon.\n\n` +
+      `🎉 <b>You're all set, ${firstName}!</b>\n\n` +
+      `That's a wrap on your onboarding. Here's what happens next:\n\n` +
+      `<b>Within 24 hours</b>\n` +
+      `📋 Your coach reviews your full profile\n\n` +
+      `<b>Within 48 hours</b>\n` +
+      `🥗 Your personalised meal plan is ready\n` +
+      `🏋️ Your custom workout plan drops\n\n` +
+      `<b>Day 1 of your plan</b>\n` +
+      `📱 Check-in reminder from your coach\n\n` +
+      `In the meantime — start tomorrow:\n` +
+      `💧 Drink <b>3 litres of water</b> every day. It's the single highest-ROI thing you can do right now.\n\n` +
       `Welcome to the Mealzy family! 💚`,
-      { parse_mode: "Markdown" }
+      { parse_mode: "HTML" }
     );
 
     // Forward the completed data if FORWARD_CHAT_ID is set
@@ -750,7 +837,15 @@ export async function handleCallbackQuery(ctx) {
     await handleUndo(ctx);
     return;
   }
-  
+
+  if (data === "skip") {
+    await ctx.answerCallbackQuery({ text: "Skipped! ⏭️" });
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    // Treat "skip" as if the user typed "skip" — the LLM will handle it gracefully
+    await processUserMessage(ctx, "skip");
+    return;
+  }
+
   if (!data.startsWith("ans_")) return;
   
   const chatId = ctx.chat.id;
