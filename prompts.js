@@ -67,7 +67,11 @@ Respond with a JSON object with two keys:
 - "extracted": Object with field keys and their extracted values. Only include fields that are clearly mentioned. For 'select' types, map to the closest matching option. For 'multiselect', return an array. For 'yesno', return true/false. For 'number', return a number. For 'scale', return a number 1-10.
 - "missing": Array of field keys that still need to be collected for this group of questions.
 
-Be generous in interpretation — if someone says "non veg" match it to "Non-Vegetarian". If they say "around 70 kgs" extract 70. If they say "nah" for yesno, that's false.
+Be EXTREMELY generous in interpretation:
+- If the field is a text string (like 'weekendRoutine' or 'goals') and the user gives ANY answer ("relax", "sleep", "nothing much", "i dont know"), EXTRACT it! Do not leave it empty.
+- If they say "non veg" match it to "Non-Vegetarian". 
+- If they say "around 70 kgs" extract 70. 
+- If they say "nah" for yesno, that's false.
 
 Return ONLY valid JSON, nothing else.`;
 
