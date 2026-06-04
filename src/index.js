@@ -9,8 +9,8 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
   console.error('TELEGRAM_BOT_TOKEN is missing in .env');
   process.exit(1);
 }
-if (!process.env.GROQ_API_KEY) {
-  console.error('GROQ_API_KEY is missing in .env');
+if (!process.env.GEMINI_API_KEY) {
+  console.error('GEMINI_API_KEY is missing in .env');
   process.exit(1);
 }
 
