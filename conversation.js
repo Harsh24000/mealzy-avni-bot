@@ -71,6 +71,7 @@ function getState(chatId) {
       completed: false,
       startedAt: Date.now(),
       lastActivity: Date.now(),
+      stateHistory: [],
     });
   }
   const state = userStates.get(chatId);
@@ -347,6 +348,17 @@ export async function processUserMessage(ctx, userMessage) {
   }
 
   // --- Step 2: Store extracted fields ---
+  if (Object.keys(extracted).length > 0) {
+    // Save snapshot for /undo feature
+    state.stateHistory.push({
+      currentSectionIndex: state.currentSectionIndex,
+      currentGroupIndex: state.currentGroupIndex,
+      data: JSON.parse(JSON.stringify(state.data)),
+      awaitingPhoto: state.awaitingPhoto,
+      completed: state.completed,
+    });
+  }
+
   for (const [key, value] of Object.entries(extracted)) {
     if (value !== null && value !== undefined && value !== "") {
       state.data[key] = value;
@@ -730,7 +742,16 @@ export async function handleVoice(ctx) {
  */
 export async function handleCallbackQuery(ctx) {
   const data = ctx.callbackQuery?.data;
-  if (!data || !data.startsWith("ans_")) return;
+  if (!data) return;
+  
+  if (data === "undo") {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    await handleUndo(ctx);
+    return;
+  }
+  
+  if (!data.startsWith("ans_")) return;
   
   const chatId = ctx.chat.id;
   const state = getState(chatId);
@@ -761,5 +782,45 @@ export async function handleCallbackQuery(ctx) {
     await processUserMessage(ctx, answer);
   } else {
     await ctx.answerCallbackQuery({ text: "Invalid option." });
+  }
+}
+
+/**
+ * Handle the /undo command or "Undo" button
+ */
+export async function handleUndo(ctx) {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  
+  if (state.stateHistory && state.stateHistory.length > 0) {
+    const previousState = state.stateHistory.pop();
+    state.currentSectionIndex = previousState.currentSectionIndex;
+    state.currentGroupIndex = previousState.currentGroupIndex;
+    state.data = previousState.data;
+    state.awaitingPhoto = previousState.awaitingPhoto;
+    state.completed = previousState.completed;
+    
+    await simulateTyping(ctx, 1000);
+    await ctx.reply("⏪ <i>Undoing your last answer...</i>", { parse_mode: "HTML" });
+    
+    // Check what is missing now and ask
+    const section = getCurrentSection(state);
+    const missing = getMissingFieldsInGroup(state);
+    
+    if (missing.length > 0) {
+      let keyboard = null;
+      if (missing[0].options && missing[0].options.length <= 12) {
+        keyboard = createOptionsKeyboard(missing[0].key, missing[0].options);
+      }
+      await sendBotMessage(ctx, state, missing[0].question, keyboard);
+    } else {
+      await ctx.reply("Ready to continue! Just say 'hi' or tell me your answer.");
+    }
+  } else {
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: "Can't go back any further!" });
+    } else {
+      await ctx.reply("Can't go back any further!");
+    }
   }
 }
