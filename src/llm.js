@@ -107,14 +107,18 @@ FREE-TEXT (routine, diet, goals, habits, stressors, cooking): accept any message
 ═══════════════════════════════════════════════
 RULES
 ═══════════════════════════════════════════════
-1. Replies are 1-2 sentences. Warm, witty, human. React to what they actually said.
+1. Replies are SHORT — 1 sentence, max 2. Talk like a friend texting, not an assistant.
 2. advance=true ONLY when userMessage truly answers currentQuestion. extractedValue = clean answer.
-3. When advance=true, ALWAYS weave nextQuestion into the same reply — with a little personality.
+3. When advance=true:
+   - If nextQuestion is provided → react to their answer warmly AND ask the nextQuestion, all in one natural line.
+   - If nextQuestion is null → just react warmly to their answer in a few words (e.g. "Harsh — love it!" or "21, perfect 💪"). Do NOT ask any question; the app will ask the next one. NEVER invent or repeat a question when nextQuestion is null.
 4. When advance=false, extractedValue MUST be null.
-5. Use emojis naturally (0-1 per message) to add warmth. Never use corporate phrases. Never be flat or robotic.
-6. ALWAYS react to the emotional content first when it matters (struggles, big goals, insecurities) — THEN ask the next question.`;
+5. Use emojis naturally (0-1 per message). Never corporate-speak. Never flat or robotic.
+6. React to emotional content first when it matters (struggles, big goals, insecurities), THEN continue.
+7. Vary your wording every time — never sound scripted. Real people don't repeat the same phrases.
+8. Be genuinely expressive: surprise ("Whoa, nice!"), warmth ("Love that 🙌"), playful teasing ("Ha, smooth try 😏"), encouragement ("You've got this!"). Match the user's energy.`;
 
-const NON_ANSWERS = /^(hi|hey|hello|why|what|who|how|when|where|which|lol|ok|okay|no|yes|idk|hmm|hm|haha|lmao|bruh|bro|sis|sup|yo|test|bot|nothing|none|idc|sure|fine|whatever|dunno|maybe|skip|bye|stop|nope|yep|nah|meh|kya|nahi|haan|theek|arre|yaar|bhai|dude|ask|next|continue|meaning|meanng|matlab|huh|samjha|elaborate|explain)$/i;
+const NON_ANSWERS = /^(hi|hey|hello|why|what|who|how|when|where|which|lol|ok|okay|no|yes|idk|hmm|hm|haha|lmao|bruh|bro|sis|sup|yo|test|bot|nothing|none|idc|sure|fine|whatever|dunno|maybe|skip|bye|stop|nope|yep|nah|meh|kya|nahi|haan|theek|arre|yaar|bhai|dude|ask|next|continue|meaning|meanng|matlab|huh|samjha|elaborate|explain|guess|guess me|batao|pata nahi|kuch bhi|anything|you tell me|u tell me)$/i;
 
 const CONFUSED = /\b(meaning|meanng|mean|matlab|samjha nahi|samajh nahi|kya matlab|i don'?t (get|understand)|what do you mean|explain|elaborate|huh|unclear|confus|समझ नहीं|क्या मतलब)\b/i;
 const WANTS_SIMPLER = /\b(one by one| one at a time|break (it|this) down|ek ek|ek-ek|simpl|step by step|slowly)\b/i;
@@ -147,6 +151,7 @@ function localValidate(userMessage, expectedType, question) {
   const type = (expectedType || '').toLowerCase();
   const q = question || 'Could you answer that again?';
 
+  // NUMERIC FIELDS
   if (type.includes('age') || type.includes('integer')) {
     const n = Number(msg);
     if (!isNaN(n) && n >= 5 && n <= 120) return { classification: 'VALID', extractedValue: String(n), reply: 'Got it!', advance: true };
@@ -170,7 +175,11 @@ function localValidate(userMessage, expectedType, question) {
     return { classification: 'INVALID', extractedValue: null, reply: `A rough number is fine — ${q}`, advance: false };
   }
 
+  // NAME FIELD
   if (type.includes('name')) {
+    if (/guess|you tell me|u tell me|tum batao|aap batao/i.test(msg)) {
+      return { classification: 'GUESSING_GAME', extractedValue: null, reply: `Haha, I'd probably guess wrong 😄 What should I actually call you?`, advance: false };
+    }
     const nameMatch = msg.match(/(?:my name is|i am|call me|naam hai|naam|i'?m)\s+([a-zA-Z]+)/i);
     if (nameMatch) {
       const name = nameMatch[1].charAt(0).toUpperCase() + nameMatch[1].slice(1);
@@ -186,6 +195,7 @@ function localValidate(userMessage, expectedType, question) {
     return { classification: 'INVALID', extractedValue: null, reply: `What should I call you? Any name or nickname works!`, advance: false };
   }
 
+  // FREE-TEXT FIELDS — judge whether it's a real answer
   if (CONFUSED.test(msg) || msg === '?') {
     return { classification: 'CLARIFICATION', extractedValue: null, reply: explainQuestion(question, q), advance: false };
   }
@@ -195,9 +205,11 @@ function localValidate(userMessage, expectedType, question) {
   if (WANTS_OPTIONS.test(msg)) {
     return { classification: 'CLARIFICATION', extractedValue: null, reply: explainQuestion(question, q), advance: false };
   }
+  // reject bare meta/noise words
   if (NON_ANSWERS.test(msg) || msg.length < 3) {
     return { classification: 'INVALID', extractedValue: null, reply: `Could you say a bit more? ${q}`, advance: false };
   }
+  // genuine description
   return { classification: 'VALID', extractedValue: msg, reply: pick(['Got it!', 'Makes sense!', 'Noted!']), advance: true };
 }
 
@@ -209,6 +221,7 @@ export async function validateAndReply({ question, expectedType, userMessage, ne
     nextQuestion: nextQuestion || null,
   });
 
+  // Build Gemini conversation (map assistant -> model)
   const contents = [];
   for (const m of history) {
     contents.push({
@@ -221,7 +234,7 @@ export async function validateAndReply({ question, expectedType, userMessage, ne
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error('GEMINI_API_KEY missing');
-    const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
     const res = await fetch(url, {
@@ -231,9 +244,11 @@ export async function validateAndReply({ question, expectedType, userMessage, ne
         system_instruction: { parts: [{ text: SYSTEM_PROMPT() }] },
         contents,
         generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 220,
+          temperature: 0.85,
+          maxOutputTokens: 200,
           responseMimeType: 'application/json',
+          // Disable 2.5-flash "thinking" — faster replies + no token truncation
+          thinkingConfig: { thinkingBudget: 0 },
         },
       }),
     });
