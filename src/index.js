@@ -59,7 +59,8 @@ async function advance(ctx) {
 }
 
 async function finish(ctx) {
-  await ctx.reply("That's everything! Give me a second to put your profile together...");
+  const name = ctx.session.data.name ? `, ${ctx.session.data.name}` : '';
+  await ctx.reply(`And that's a wrap${name}! 🎉 Give me a sec to pull it all together...`);
 
   const summary = buildSummary(ctx.session.data);
 
@@ -86,7 +87,7 @@ async function finish(ctx) {
   }
 
   await ctx.reply(
-    "You're all set! Your coach will review your profile and reach out soon. Great job getting through all of that 💪\n\nType /start if you ever need to redo the form."
+    "You're all set 🙌 Your coach is gonna go through everything and reach out super soon. Honestly, you did great — this is the hardest part and you crushed it 💪\n\n(Wanna change anything? Just hit /start anytime.)"
   );
 
   ctx.session.step = -1;
@@ -103,7 +104,7 @@ bot.command('start', async (ctx) => {
 
   const botName = process.env.BOT_NAME || 'Avni';
   await ctx.reply(
-    `Hey! Welcome to *Mealzy* 🥗\n\nI'm ${botName}, and I'll be helping your coach understand you before they put together your personalized plan.\n\nWe'll go through 13 sections — it takes about 10–15 minutes. Ready? Let's do this!`,
+    `Heyy! I'm ${botName} 🙌 Super glad you're here.\n\nI'm gonna get to know you a little before your coach builds your plan — no boring form, just a quick chat. Promise it'll be painless 😄`,
     { parse_mode: 'Markdown' }
   );
   await sendStep(ctx, STEPS[0]);
@@ -115,7 +116,7 @@ bot.command('restart', async (ctx) => {
   ctx.session.multiSelectState = [];
   ctx.session.waitingForLLM = false;
   ctx.session.history = [];
-  await ctx.reply("Starting over from the beginning!");
+  await ctx.reply("No worries, let's start fresh 🙂");
   await sendStep(ctx, STEPS[0]);
 });
 
@@ -155,15 +156,15 @@ bot.on('callback_query:data', async (ctx) => {
 // Text messages — run through LLM for text-type steps
 bot.on('message:text', async (ctx) => {
   if (ctx.session.step < 0) {
-    return ctx.reply("Hey! Type /start to begin your Mealzy onboarding.");
+    return ctx.reply("Hey there! 👋 Tap /start whenever you're ready to dive in.");
   }
 
   const step = currentStep(ctx);
   if (!step) return;
 
-  // If it's a button/scale/multiselect step, ignore plain text
+  // If it's a button/scale/multiselect step, nudge toward the buttons
   if (step.type !== 'text') {
-    return ctx.reply("Please use the buttons above to answer this one!");
+    return ctx.reply("Just tap one of the buttons up there for this one 👆");
   }
 
   // Prevent hammering the LLM while waiting
@@ -212,19 +213,20 @@ bot.on('message:photo', async (ctx) => {
   if (ctx.session.step < 0) return;
   const step = currentStep(ctx);
   if (!step || step.type !== 'photo') {
-    return ctx.reply("Please answer the current question first.");
+    return ctx.reply("Ooh, hold that photo for a sec — let's finish this question first 😊");
   }
 
   const photo = ctx.message.photo[ctx.message.photo.length - 1];
   ctx.session.data[step.key] = photo.file_id;
-  await ctx.reply("Got it!");
+  const photoAcks = ['Perfect, got it 📸', 'Nice one — saved!', 'Awesome, that works great 🙌', 'Got it, looking good!'];
+  await ctx.reply(photoAcks[Math.floor(Math.random() * photoAcks.length)]);
   await advance(ctx);
 });
 
 // Catch-all for unsupported message types
 bot.on('message', async (ctx) => {
   if (!ctx.message.text && !ctx.message.photo) {
-    await ctx.reply("I can only handle text and photos right now!");
+    await ctx.reply("Ah, I can only read text and photos for now 😅 mind typing it out?");
   }
 });
 
