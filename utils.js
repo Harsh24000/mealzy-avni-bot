@@ -4,6 +4,8 @@
  * input sanitization, and other shared helpers.
  */
 
+import { InlineKeyboard } from "grammy";
+
 // ---------------------------------------------------------------------------
 // Timing helpers
 // ---------------------------------------------------------------------------
@@ -279,4 +281,23 @@ export function sanitizeInput(text) {
       // Collapse multiple consecutive spaces into one
       .replace(/ {2,}/g, " ")
   );
+}
+
+/**
+ * Creates an InlineKeyboard for select/multiselect fields.
+ * @param {string} fieldKey - The field identifier
+ * @param {string[]} options - The array of string options
+ */
+export function createOptionsKeyboard(fieldKey, options) {
+  const keyboard = new InlineKeyboard();
+  options.forEach((opt, idx) => {
+    keyboard.text(opt, `ans_${fieldKey}_${idx}`);
+    if (idx % 2 === 1) keyboard.row(); // 2 buttons per row
+  });
+  
+  // Ensure the Undo button is on a new row
+  if (options.length % 2 !== 0) keyboard.row();
+  keyboard.text("↩️ Undo Last Question", "undo");
+
+  return keyboard;
 }
