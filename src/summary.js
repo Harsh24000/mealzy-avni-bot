@@ -5,8 +5,8 @@ export function buildSummary(d) {
 *1. About You*
 Name: ${v(d.name)}
 Age: ${v(d.age)}
-Height: ${v(d.height)} ${v(d.heightUnit)}
-Weight: ${v(d.weight)} ${v(d.weightUnit)}
+Height: ${v(d.height)}
+Weight: ${v(d.weight)}
 Profession: ${v(d.profession)}
 Sex: ${v(d.sex)}
 
