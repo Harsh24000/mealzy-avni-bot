@@ -1,4 +1,0 @@
-pyTelegramBotAPI
-groq
-pydantic
-python-dotenv
