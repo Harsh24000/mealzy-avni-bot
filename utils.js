@@ -61,9 +61,9 @@ export async function simulateTyping(ctx, durationMs) {
  */
 export function calculateTypingDelay(text) {
   const BASE_MS = 800;
-  const PER_CHAR_MS = 20;
+  const PER_CHAR_MS = 35;
   const MIN_DELAY = 1000;
-  const MAX_DELAY = 4000;
+  const MAX_DELAY = 6000;
 
   const raw = BASE_MS + (text?.length ?? 0) * PER_CHAR_MS;
   return Math.max(MIN_DELAY, Math.min(MAX_DELAY, raw));
