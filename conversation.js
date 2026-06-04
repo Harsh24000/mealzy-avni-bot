@@ -1,7 +1,4 @@
 import SECTIONS from "./sections.js";
-import fs from "fs";
-import path from "path";
-import os from "os";
 import {
   SYSTEM_PROMPT,
   EXTRACTION_PROMPT,
@@ -17,7 +14,6 @@ import {
   generateTransition,
   generateWelcome,
   generateSummary,
-  transcribeAudio,
 } from "./llm.js";
 import {
   simulateTyping,
@@ -26,9 +22,6 @@ import {
   fillTemplate,
   formatSummaryForTelegram,
   delay,
-  createOptionsKeyboard,
-  createSkipKeyboard,
-  buildProgressBar,
 } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -57,10 +50,6 @@ const FORWARD_CHAT_ID = process.env.FORWARD_CHAT_ID || null;
 // Max messages to keep in history for LLM context
 const MAX_HISTORY = 12;
 
-// Per-user processing lock to prevent message storms
-// When the bot is mid-processing a message for a user, we block new ones
-const processingLocks = new Map();
-
 // ---------------------------------------------------------------------------
 // State helpers
 // ---------------------------------------------------------------------------
@@ -77,24 +66,11 @@ function getState(chatId) {
       completed: false,
       startedAt: Date.now(),
       lastActivity: Date.now(),
-      stateHistory: [],
-      nudgeSent: false,
     });
   }
   const state = userStates.get(chatId);
   state.lastActivity = Date.now();
   return state;
-}
-
-/**
- * Returns users who have been inactive for more than `thresholdMs` and are
- * not yet completed and haven't been nudged yet.
- */
-export function getInactiveUsers(thresholdMs = 3 * 60 * 60 * 1000) {
-  const now = Date.now();
-  return [...userStates.values()].filter(
-    (s) => !s.completed && !s.nudgeSent && (now - s.lastActivity) > thresholdMs
-  );
 }
 
 function resetState(chatId) {
@@ -248,10 +224,7 @@ export async function handleStart(ctx) {
   const state = getState(chatId);
 
   // Generate welcome message via LLM
-  const welcomePrompt = fillTemplate(WELCOME_PROMPT, { 
-    botName: BOT_NAME,
-    currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute:'2-digit' })
-  });
+  const welcomePrompt = fillTemplate(WELCOME_PROMPT, { botName: BOT_NAME });
 
   await simulateTyping(ctx, 1500);
   let welcomeMsg;
@@ -264,7 +237,6 @@ export async function handleStart(ctx) {
   await sendBotMessage(ctx, state, welcomeMsg);
 }
 
-
 /**
  * Handle the /restart command.
  */
@@ -276,22 +248,6 @@ export async function handleRestart(ctx) {
 }
 
 /**
- * Handle the /help command.
- */
-export async function handleHelp(ctx) {
-  await ctx.reply(
-    `🤖 <b>Here's what you can do:</b>\n\n` +
-    `▶️ /start — Begin onboarding\n` +
-    `📊 /status — See your progress\n` +
-    `↩️ /undo — Undo your last answer\n` +
-    `🔄 /restart — Start over from scratch\n` +
-    `❓ /help — Show this menu\n\n` +
-    `You can also send a 🎙 <b>voice note</b> instead of typing any answer!`,
-    { parse_mode: "HTML" }
-  );
-}
-
-/**
  * Handle the /status command — show progress.
  */
 export async function handleStatus(ctx) {
@@ -299,39 +255,21 @@ export async function handleStatus(ctx) {
   const state = getState(chatId);
 
   if (state.completed) {
-    await ctx.reply(
-      `🎉 <b>Onboarding Complete!</b>\n\nYou've finished all sections. Your coach will be in touch within 24 hours.\n\nType /restart if you need to redo anything.`,
-      { parse_mode: 'HTML' }
-    );
+    await ctx.reply("You've already completed the onboarding! 🎉\nType /restart if you want to start over.");
     return;
   }
 
   const current = getCurrentSection(state);
-  const totalSections = SECTIONS.filter(s => s.id !== 'review-submit').length;
-  const completedCount = state.currentSectionIndex;
-  const progress = Math.round((completedCount / totalSections) * 100);
-  const progressBar = buildProgressBar(completedCount, totalSections);
-
-  const sectionIcons = [
-    '👤', '🥗', '🗓', '🏥', '💊', '😴', '🏋️', '🥘', '🎯', '❤️', '📸', '🚶', '✅'
-  ];
-
-  const sectionLines = SECTIONS
-    .filter(s => s.id !== 'review-submit')
-    .map((s, i) => {
-      const icon = sectionIcons[i] ?? '🔵';
-      if (i < completedCount) return `✅ <s>${s.name}</s>`;
-      if (i === completedCount) return `▶️ <b>${s.name}</b> ← you are here`;
-      return `⚪️ ${s.name}`;
-    }).join('\n');
+  const totalSections = SECTIONS.length - 1; // exclude review
+  const progress = Math.round((state.currentSectionIndex / totalSections) * 100);
 
   await ctx.reply(
-    `📊 <b>Your Mealzy Progress</b>\n\n` +
-    `${progressBar} <b>${progress}%</b>\n` +
-    `Section ${completedCount} of ${totalSections} complete\n\n` +
-    `<b>Sections:</b>\n${sectionLines}\n\n` +
-    `💡 Tip: Send a voice note to answer faster!`,
-    { parse_mode: 'HTML' }
+    `📊 *Your Progress*\n\n` +
+    `Currently on: *${current?.name ?? "Unknown"}*\n` +
+    `Section ${state.currentSectionIndex + 1} of ${totalSections}\n` +
+    `Progress: ${progress}%\n\n` +
+    `Keep going, you're doing great! 💪`,
+    { parse_mode: "Markdown" }
   );
 }
 
@@ -339,40 +277,11 @@ export async function handleStatus(ctx) {
  * Handle an incoming text message during onboarding.
  */
 export async function handleMessage(ctx) {
-  const userMessage = ctx.message?.text?.trim();
-  if (!userMessage) return;
-  await processUserMessage(ctx, userMessage);
-}
-
-/**
- * Core logic for processing a user's text input
- */
-export async function processUserMessage(ctx, userMessage) {
   const chatId = ctx.chat.id;
-
-  // IMMEDIATELY show typing indicator so the bot feels instantly responsive
-  ctx.api.sendChatAction(chatId, "typing").catch(() => {});
-
-  // Processing lock — if we're already handling a message for this user, silently drop new ones
-  // This prevents the message storm when the API is slow
-  if (processingLocks.get(chatId)) {
-    console.log(`[Lock] Dropping duplicate message from ${chatId}: "${userMessage}"`);
-    return;
-  }
-  processingLocks.set(chatId, true);
-
-  try {
-    await _processUserMessageInner(ctx, chatId, userMessage);
-  } finally {
-    processingLocks.delete(chatId);
-  }
-}
-
-/**
- * Inner core logic — only runs when lock is held.
- */
-async function _processUserMessageInner(ctx, chatId, userMessage) {
   const state = getState(chatId);
+  const userMessage = ctx.message?.text?.trim();
+
+  if (!userMessage) return;
 
   // If completed, tell them
   if (state.completed) {
@@ -385,31 +294,6 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
     await simulateTyping(ctx, 800);
     await ctx.reply(`I'm waiting for your ${state.awaitingPhoto.replace(/([A-Z])/g, " $1").toLowerCase().replace("photo ", "")} photo 📸\n\nJust send it as a photo and I'll save it!`);
     return;
-  }
-
-  // Handle "BRB" protocol
-  const lowerMsg = userMessage.toLowerCase();
-  const brbPhrases = ["brb", "be right back", "need to go", "hold on", "give me a sec", "pause", "g2g", "gtg", "1 min", "wait"];
-  if (brbPhrases.some(p => lowerMsg === p || lowerMsg.startsWith(p))) {
-    state.nudgeSent = true; // Disable nudge
-    await simulateTyping(ctx, 1000);
-    await ctx.reply("no stress at all, take your time! just say 'hi' when you're back.");
-    return;
-  }
-
-  // Handle "skip" text
-  if (lowerMsg === "skip") {
-    const missing = getMissingFieldsInGroup(state);
-    if (missing.length > 0) {
-      if (!missing[0].required) {
-        state.data[missing[0].key] = "Skipped";
-        addToHistory(state, "User", "[Skipped]");
-      } else {
-        await simulateTyping(ctx, 1000);
-        await ctx.reply(`I actually really need this one to create your plan! Tell me even a little bit 🙏\n\n${missing[0].question}`);
-        return;
-      }
-    }
   }
 
   addToHistory(state, "User", userMessage);
@@ -429,11 +313,9 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
   // --- Step 1: Extract fields from the user's message ---
   const groupFields = getCurrentGroupFields(state);
   const allSectionFields = section.fields.filter((f) => f.type !== "photo");
-  const fieldsForExtraction = allSectionFields.length > 0 ? allSectionFields : groupFields;
-  const currentGroup = getMissingFieldsInGroup(state);
 
-  let extracted = {};
-  let missing = [];
+  // Use all section fields for extraction (user might answer ahead)
+  const fieldsForExtraction = allSectionFields.length > 0 ? allSectionFields : groupFields;
 
   const extractionContext = [
     `Current section: ${section.name}`,
@@ -441,6 +323,9 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
     `Already collected: ${buildCollectedData(state, fieldsForExtraction)}`,
     `User message: ${userMessage}`,
   ].join("\n\n");
+
+  let extracted = {};
+  let missing = [];
 
   try {
     const result = await extractFields(EXTRACTION_PROMPT, extractionContext);
@@ -450,31 +335,7 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
     console.error("[Conversation] Extraction failed:", err.message);
   }
 
-  // Final safety net: if everything failed and there's a single open-ended field,
-  // just store the raw message
-  if (Object.keys(extracted).length === 0 && lowerMsg !== "skip") {
-    const missingFields = getMissingFieldsInGroup(state);
-    if (missingFields.length > 0) {
-      const f = missingFields[0];
-      if ((f.type === "text" || f.type === "longtext") && userMessage.length >= 2) {
-        console.log(`[Fallback] Raw store: "${userMessage}" → "${f.key}"`);
-        extracted[f.key] = userMessage;
-      }
-    }
-  }
-
   // --- Step 2: Store extracted fields ---
-  if (Object.keys(extracted).length > 0) {
-    // Save snapshot for /undo feature
-    state.stateHistory.push({
-      currentSectionIndex: state.currentSectionIndex,
-      currentGroupIndex: state.currentGroupIndex,
-      data: JSON.parse(JSON.stringify(state.data)),
-      awaitingPhoto: state.awaitingPhoto,
-      completed: state.completed,
-    });
-  }
-
   for (const [key, value] of Object.entries(extracted)) {
     if (value !== null && value !== undefined && value !== "") {
       state.data[key] = value;
@@ -499,7 +360,7 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
       }
 
       if (advancement === "next-section") {
-        // Generate transition message to next section (the LLM handles this naturally)
+        // Generate transition message to next section
         const nextSection = getCurrentSection(state);
 
         // Special handling for photo section
@@ -530,13 +391,7 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
         try {
           transitionMsg = await generateTransition(transitionContext, "Generate the transition message.");
         } catch {
-          // Fallback transitions — human sounding
-          const fallbacks = [
-            `okay cool, we're done with that bit! now let's get into ${nextSection.name.toLowerCase()}.`,
-            `nice, all good there. moving on — ${nextSection.name.toLowerCase()} next.`,
-            `alright! let's shift to ${nextSection.name.toLowerCase()} now.`,
-          ];
-          transitionMsg = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+          transitionMsg = `Alright, got it! Let's move on to ${nextSection.name.toLowerCase()} now.`;
         }
 
         await sendBotMessage(ctx, state, transitionMsg);
@@ -557,16 +412,6 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
 
   // --- Step 4: Generate conversational response for remaining fields ---
   const currentMissing = getMissingFieldsInGroup(state);
-
-  let keyboard = null;
-  if (currentMissing.length > 0 && currentMissing[0].options && currentMissing[0].options.length <= 12) {
-    keyboard = createOptionsKeyboard(currentMissing[0].key, currentMissing[0].options);
-  } else if (currentMissing.length > 0 && !currentMissing[0].required) {
-    keyboard = createSkipKeyboard();
-  }
-
-  let response;
-
   const responseContext = fillTemplate(RESPONSE_PROMPT, {
     botName: BOT_NAME,
     sectionName: section.name,
@@ -575,31 +420,23 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
     missingFields: buildFieldDefinitions(currentMissing),
     userProfile: buildUserProfile(state),
     conversationHistory: buildConversationHistory(state),
-    currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute:'2-digit' })
   });
 
   await simulateTyping(ctx, calculateTypingDelay("response"));
 
+  let response;
   try {
     response = await generateResponse(responseContext, "Generate your next message.");
-  } catch (err) {
-    console.error("[Response] generateResponse failed:", err.message);
-    // Retry once after 2s
-    try {
-      await delay(2000);
-      response = await generateResponse(responseContext, "Generate your next message.");
-    } catch {
-      // Final fallback — human-sounding, never robotic
-      const fallbacks = [
-        "sorry my internet just glitched, could you repeat that? 😅",
-        "wait sorry I missed that, telegram is acting up — what did you say?",
-        "sorry give me a sec, my connection just dropped... what was that again?",
-      ];
-      response = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  } catch {
+    // Fallback: ask about the first missing field directly
+    if (currentMissing.length > 0) {
+      response = currentMissing[0].question;
+    } else {
+      response = "Got it! Let me just process that...";
     }
   }
 
-  await sendBotMessage(ctx, state, response, keyboard);
+  await sendBotMessage(ctx, state, response);
 }
 
 /**
@@ -746,28 +583,13 @@ async function handleReviewResponse(ctx, state, userMessage) {
     state.completed = true;
 
     await simulateTyping(ctx, 1200);
-
-    // Premium completion experience
-    const firstName = (state.data.fullName || "").split(" ")[0] || "";
     await ctx.reply(
-      `🎉 <b>You're all set, ${firstName}!</b>\n\n` +
-      `That's a wrap on your onboarding. Here's what happens next:\n\n` +
-      `<b>Within 24 hours</b>\n` +
-      `📋 Your coach reviews your full profile\n\n` +
-      `<b>Within 48 hours</b>\n` +
-      `🥗 Your personalised meal plan is ready\n` +
-      `🏋️ Your custom workout plan drops\n\n` +
-      `<b>Day 1 of your plan</b>\n` +
-      `📱 Check-in reminder from your coach\n\n` +
-      `In the meantime — start tomorrow:\n` +
-      `💧 Drink <b>3 litres of water</b> every day. It's the single highest-ROI thing you can do right now.\n\n` +
+      `You're all set! 🎉\n\n` +
+      `Thanks for taking the time to chat with me, ${state.data.fullName || ""}! ` +
+      `Your coach will review everything and get back to you soon.\n\n` +
       `Welcome to the Mealzy family! 💚`,
-      { parse_mode: "HTML" }
+      { parse_mode: "Markdown" }
     );
-    
-    // Warm follow up 5 seconds later
-    await delay(5000);
-    await ctx.reply(`I'll be right here if you need anything else before your plan drops. Go get some rest! 😌`);
 
     // Forward the completed data if FORWARD_CHAT_ID is set
     if (FORWARD_CHAT_ID) {
@@ -822,241 +644,18 @@ async function handleReviewResponse(ctx, state, userMessage) {
 // Utility: send a message and track in history
 // ---------------------------------------------------------------------------
 
-async function sendBotMessage(ctx, state, rawText, keyboard = null) {
-  let text = rawText;
-  
-  // 1. Parse Reactions
-  const reactMatch = text.match(/\[REACT:\s*(.+?)\]/i);
-  if (reactMatch) {
-    const emoji = reactMatch[1].trim();
-    text = text.replace(reactMatch[0], "").trim();
-    try {
-      await ctx.react(emoji);
-    } catch (e) {
-      console.error("[Reactions] Failed to react:", e.message);
-    }
-  }
-
-  // 2. Parse Stickers
-  const stickerMatch = text.match(/\[STICKER:\s*(.+?)\]/i);
-  let stickerEmoji = null;
-  if (stickerMatch) {
-    stickerEmoji = stickerMatch[1].trim();
-    text = text.replace(stickerMatch[0], "").trim();
-  }
-
-  // 3. Typo Illusion (5% chance)
-  let typoCorrection = null;
-  if (Math.random() < 0.05 && text.length > 20 && !text.includes("http")) {
-    if (text.includes("you're")) {
-       text = text.replace("you're", "your");
-       typoCorrection = "*you're";
-    } else if (text.includes("their")) {
-       text = text.replace("their", "there");
-       typoCorrection = "*their";
-    } else if (text.includes("too ")) {
-       text = text.replace("too ", "to ");
-       typoCorrection = "*too";
-    }
-  }
-
+async function sendBotMessage(ctx, state, text) {
   const messages = splitMessages(text, 4000);
 
   for (let i = 0; i < messages.length; i++) {
     if (i > 0) {
       await simulateTyping(ctx, calculateTypingDelay(messages[i]));
     }
-    const options = { parse_mode: "HTML" };
-    // Only attach keyboard to the very last text chunk if no sticker/typo follows
-    if (keyboard && i === messages.length - 1 && !stickerEmoji && !typoCorrection) {
-      options.reply_markup = keyboard;
-    }
-    try {
-      await ctx.reply(messages[i], options);
-    } catch {
-      await ctx.reply(messages[i]);
-    }
+    await ctx.reply(messages[i]);
     if (i < messages.length - 1) {
       await delay(400);
     }
   }
 
-  // Send Sticker if any
-  if (stickerEmoji) {
-    await simulateTyping(ctx, 600);
-    const options = {};
-    if (keyboard && !typoCorrection) options.reply_markup = keyboard;
-    await ctx.reply(stickerEmoji, options);
-  }
-
-  // Send Correction if any
-  if (typoCorrection) {
-    await simulateTyping(ctx, 1200);
-    const options = {};
-    if (keyboard) options.reply_markup = keyboard;
-    await ctx.reply(typoCorrection, options);
-  }
-
-  addToHistory(state, "Bot", rawText);
-}
-
-// ---------------------------------------------------------------------------
-// PM Features: Voice & Callbacks
-// ---------------------------------------------------------------------------
-
-/**
- * Handle incoming voice notes
- */
-export async function handleVoice(ctx) {
-  const chatId = ctx.chat.id;
-  const state = getState(chatId);
-  if (state.completed) {
-    await ctx.reply("You've already completed the onboarding! 🎉");
-    return;
-  }
-  
-  await ctx.api.sendChatAction(chatId, "typing");
-  
-  try {
-    const file = await ctx.getFile();
-    const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    
-    const response = await fetch(url);
-    const buffer = await response.arrayBuffer();
-    
-    const tmpPath = path.join(os.tmpdir(), `voice_${chatId}_${Date.now()}.ogg`);
-    fs.writeFileSync(tmpPath, Buffer.from(buffer));
-    
-    await simulateTyping(ctx, 1000);
-    const text = await transcribeAudio(tmpPath);
-    fs.unlinkSync(tmpPath);
-    
-    await ctx.reply(`<i>🎙 Transcribed: "${text}"</i>`, { parse_mode: "HTML" });
-    
-    await processUserMessage(ctx, text);
-  } catch (err) {
-    console.error("[Voice] Error processing voice note:", err);
-    await ctx.reply("Sorry, I had trouble processing that voice note. Could you type it out instead?");
-  }
-}
-
-/**
- * Handle inline keyboard button clicks
- */
-export async function handleCallbackQuery(ctx) {
-  const data = ctx.callbackQuery?.data;
-  if (!data) return;
-  
-  if (data === "undo") {
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
-    await handleUndo(ctx);
-    return;
-  }
-
-  if (data === "skip") {
-    await ctx.answerCallbackQuery({ text: "Skipped! ⏭️" });
-    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
-    
-    // Actually advance past the current optional question group
-    const chatId = ctx.chat.id;
-    const state = getState(chatId);
-    if (!state.completed) {
-      // Mark all optional fields in current group with a skip sentinel
-      const groupFields = getCurrentGroupFields(state);
-      for (const f of groupFields) {
-        if (!f.required && (state.data[f.key] === undefined || state.data[f.key] === null)) {
-          state.data[f.key] = null; // explicitly null = user skipped
-        }
-      }
-      // Advance to next group
-      const section = getCurrentSection(state);
-      if (section && state.currentGroupIndex < section.grouping.length - 1) {
-        state.currentGroupIndex++;
-      } else {
-        advance(state);
-      }
-      // Ask next question naturally via LLM
-      await processUserMessage(ctx, "let's move on");
-    }
-    return;
-  }
-
-  if (!data.startsWith("ans_")) return;
-  
-  const chatId = ctx.chat.id;
-  const state = getState(chatId);
-  if (state.completed) {
-    await ctx.answerCallbackQuery({ text: "You've already finished onboarding!" });
-    return;
-  }
-  
-  const parts = data.split("_");
-  const idx = parseInt(parts.pop(), 10);
-  const fieldKey = parts.slice(1).join("_");
-  
-  let field = null;
-  for (const sec of SECTIONS) {
-    const f = sec.fields.find(x => x.key === fieldKey);
-    if (f) {
-      field = f;
-      break;
-    }
-  }
-  
-  if (field && field.options && field.options[idx]) {
-    const answer = field.options[idx];
-    await ctx.answerCallbackQuery();
-    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
-    await ctx.reply(`👉 ${answer}`);
-    
-    await processUserMessage(ctx, answer);
-  } else {
-    await ctx.answerCallbackQuery({ text: "Invalid option." });
-  }
-}
-
-/**
- * Handle the /undo command or "Undo" button — silently restores state
- * and naturally re-asks the last question without any system message.
- */
-export async function handleUndo(ctx) {
-  const chatId = ctx.chat.id;
-  const state = getState(chatId);
-  
-  if (state.stateHistory && state.stateHistory.length > 0) {
-    const previousState = state.stateHistory.pop();
-    state.currentSectionIndex = previousState.currentSectionIndex;
-    state.currentGroupIndex = previousState.currentGroupIndex;
-    state.data = previousState.data;
-    state.awaitingPhoto = previousState.awaitingPhoto;
-    state.completed = previousState.completed;
-    
-    // No system message — just naturally re-ask the question like a human would
-    await simulateTyping(ctx, 900);
-    const missing = getMissingFieldsInGroup(state);
-    
-    if (missing.length > 0) {
-      const undoPhrases = [
-        "wait my bad, let me re-ask that —",
-        "hold on actually, let me go back —",
-        "sorry, let me redo that question —",
-        "wait actually, ignore that last one —",
-      ];
-      const prefix = undoPhrases[Math.floor(Math.random() * undoPhrases.length)];
-      let keyboard = null;
-      if (missing[0].options && missing[0].options.length <= 12) {
-        keyboard = createOptionsKeyboard(missing[0].key, missing[0].options);
-      }
-      await sendBotMessage(ctx, state, `${prefix} ${missing[0].question}`, keyboard);
-    } else {
-      await ctx.reply("okay let's keep going");
-    }
-  } else {
-    if (ctx.callbackQuery) {
-      await ctx.answerCallbackQuery({ text: "nothing to undo!" });
-    } else {
-      await ctx.reply("nothing to undo!");
-    }
-  }
+  addToHistory(state, "Bot", text);
 }
