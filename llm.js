@@ -1,5 +1,4 @@
 import Groq from "groq-sdk";
-import fs from "fs";
 
 // ---------------------------------------------------------------------------
 // Groq LLM integration for Mealzy Telegram bot
@@ -127,25 +126,4 @@ export async function generateSummary(summaryPrompt, userData) {
     temperature: 0.3,
     maxTokens: 2000,
   });
-}
-
-/**
- * Transcribe an audio file using Groq's Whisper API.
- *
- * @param {string} filePath - Path to the local audio file.
- * @returns {Promise<string>} The transcribed text.
- */
-export async function transcribeAudio(filePath) {
-  try {
-    const transcription = await groq.audio.transcriptions.create({
-      file: fs.createReadStream(filePath),
-      model: "whisper-large-v3",
-      response_format: "json",
-      language: "en",
-    });
-    return transcription.text;
-  } catch (err) {
-    console.error("[LLM] Groq Whisper error:", err.message);
-    throw err;
-  }
 }
