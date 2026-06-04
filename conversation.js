@@ -57,6 +57,10 @@ const FORWARD_CHAT_ID = process.env.FORWARD_CHAT_ID || null;
 // Max messages to keep in history for LLM context
 const MAX_HISTORY = 12;
 
+// Per-user processing lock to prevent message storms
+// When the bot is mid-processing a message for a user, we block new ones
+const processingLocks = new Map();
+
 // ---------------------------------------------------------------------------
 // State helpers
 // ---------------------------------------------------------------------------
@@ -345,6 +349,29 @@ export async function handleMessage(ctx) {
  */
 export async function processUserMessage(ctx, userMessage) {
   const chatId = ctx.chat.id;
+
+  // IMMEDIATELY show typing indicator so the bot feels instantly responsive
+  ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+
+  // Processing lock — if we're already handling a message for this user, silently drop new ones
+  // This prevents the message storm when the API is slow
+  if (processingLocks.get(chatId)) {
+    console.log(`[Lock] Dropping duplicate message from ${chatId}: "${userMessage}"`);
+    return;
+  }
+  processingLocks.set(chatId, true);
+
+  try {
+    await _processUserMessageInner(ctx, chatId, userMessage);
+  } finally {
+    processingLocks.delete(chatId);
+  }
+}
+
+/**
+ * Inner core logic — only runs when lock is held.
+ */
+async function _processUserMessageInner(ctx, chatId, userMessage) {
   const state = getState(chatId);
 
   // If completed, tell them
@@ -424,13 +451,19 @@ export async function processUserMessage(ctx, userMessage) {
     console.error("[Conversation] Extraction failed:", err.message);
   }
 
-  // --- Smart Fallback for text fields ---
-  // If extraction failed (rate limit or too rigid) and there's only 1 missing text field, 
-  // just assume whatever they typed is the answer to prevent infinite loops.
+  // --- Smart Fallback for text/longtext fields ---
+  // If extraction returned nothing (rate limit, rigid LLM, or short answer like "kk", "??")
+  // and there's a single missing open-ended field, just store whatever the user said.
+  // This is the #1 fix for infinite loops.
   if (Object.keys(extracted).length === 0 && lowerMsg !== "skip") {
     const missingFields = getMissingFieldsInGroup(state);
-    if (missingFields.length === 1 && missingFields[0].type === "text") {
-      extracted[missingFields[0].key] = userMessage;
+    if (missingFields.length > 0) {
+      const f = missingFields[0];
+      // For open-ended fields (text, longtext) — accept any non-trivial answer
+      if ((f.type === "text" || f.type === "longtext") && userMessage.length >= 2) {
+        console.log(`[Fallback] Storing "${userMessage}" directly into field "${f.key}" (type: ${f.type})`);
+        extracted[f.key] = userMessage;
+      }
     }
   }
 
@@ -538,12 +571,20 @@ export async function processUserMessage(ctx, userMessage) {
   let response;
   try {
     response = await generateResponse(responseContext, "Generate your next message.");
-  } catch {
-    // Fallback: ask about the first missing field directly, but make it slightly more natural
-    if (currentMissing.length > 0) {
-      response = `sorry, my brain glitched for a sec 😅 anyway... ${currentMissing[0].question.toLowerCase()}`;
-    } else {
-      response = "Got it! Let me just process that...";
+  } catch (err) {
+    console.error("[Response] generateResponse failed:", err.message);
+    // If Groq API fails, wait 2s and silently retry once before falling back
+    try {
+      await delay(2000);
+      response = await generateResponse(responseContext, "Generate your next message.");
+    } catch {
+      // Final fallback — ask the next question naturally but don't loop
+      if (currentMissing.length > 0) {
+        const q = currentMissing[0].question.toLowerCase();
+        response = `one sec — ${q}?`;
+      } else {
+        response = "hmm let me just check something, one moment...";
+      }
     }
   }
 
@@ -778,7 +819,44 @@ async function handleReviewResponse(ctx, state, userMessage) {
 // Utility: send a message and track in history
 // ---------------------------------------------------------------------------
 
-async function sendBotMessage(ctx, state, text, keyboard = null) {
+async function sendBotMessage(ctx, state, rawText, keyboard = null) {
+  let text = rawText;
+  
+  // 1. Parse Reactions
+  const reactMatch = text.match(/\[REACT:\s*(.+?)\]/i);
+  if (reactMatch) {
+    const emoji = reactMatch[1].trim();
+    text = text.replace(reactMatch[0], "").trim();
+    try {
+      await ctx.react(emoji);
+    } catch (e) {
+      console.error("[Reactions] Failed to react:", e.message);
+    }
+  }
+
+  // 2. Parse Stickers
+  const stickerMatch = text.match(/\[STICKER:\s*(.+?)\]/i);
+  let stickerEmoji = null;
+  if (stickerMatch) {
+    stickerEmoji = stickerMatch[1].trim();
+    text = text.replace(stickerMatch[0], "").trim();
+  }
+
+  // 3. Typo Illusion (5% chance)
+  let typoCorrection = null;
+  if (Math.random() < 0.05 && text.length > 20 && !text.includes("http")) {
+    if (text.includes("you're")) {
+       text = text.replace("you're", "your");
+       typoCorrection = "*you're";
+    } else if (text.includes("their")) {
+       text = text.replace("their", "there");
+       typoCorrection = "*their";
+    } else if (text.includes("too ")) {
+       text = text.replace("too ", "to ");
+       typoCorrection = "*too";
+    }
+  }
+
   const messages = splitMessages(text, 4000);
 
   for (let i = 0; i < messages.length; i++) {
@@ -786,8 +864,8 @@ async function sendBotMessage(ctx, state, text, keyboard = null) {
       await simulateTyping(ctx, calculateTypingDelay(messages[i]));
     }
     const options = { parse_mode: "HTML" };
-    // Only attach keyboard to the very last message chunk
-    if (keyboard && i === messages.length - 1) {
+    // Only attach keyboard to the very last text chunk if no sticker/typo follows
+    if (keyboard && i === messages.length - 1 && !stickerEmoji && !typoCorrection) {
       options.reply_markup = keyboard;
     }
     try {
@@ -800,7 +878,23 @@ async function sendBotMessage(ctx, state, text, keyboard = null) {
     }
   }
 
-  addToHistory(state, "Bot", text);
+  // Send Sticker if any
+  if (stickerEmoji) {
+    await simulateTyping(ctx, 600);
+    const options = {};
+    if (keyboard && !typoCorrection) options.reply_markup = keyboard;
+    await ctx.reply(stickerEmoji, options);
+  }
+
+  // Send Correction if any
+  if (typoCorrection) {
+    await simulateTyping(ctx, 1200);
+    const options = {};
+    if (keyboard) options.reply_markup = keyboard;
+    await ctx.reply(typoCorrection, options);
+  }
+
+  addToHistory(state, "Bot", rawText);
 }
 
 // ---------------------------------------------------------------------------
