@@ -29,6 +29,7 @@ import {
   createOptionsKeyboard,
   createSkipKeyboard,
   buildProgressBar,
+  localExtract,
 } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -429,39 +430,45 @@ async function _processUserMessageInner(ctx, chatId, userMessage) {
   // --- Step 1: Extract fields from the user's message ---
   const groupFields = getCurrentGroupFields(state);
   const allSectionFields = section.fields.filter((f) => f.type !== "photo");
-
-  // Use all section fields for extraction (user might answer ahead)
   const fieldsForExtraction = allSectionFields.length > 0 ? allSectionFields : groupFields;
-
-  const extractionContext = [
-    `Current section: ${section.name}`,
-    `Fields to extract:\n${buildFieldDefinitions(fieldsForExtraction)}`,
-    `Already collected: ${buildCollectedData(state, fieldsForExtraction)}`,
-    `User message: ${userMessage}`,
-  ].join("\n\n");
+  const currentGroup = getMissingFieldsInGroup(state);
 
   let extracted = {};
   let missing = [];
 
-  try {
-    const result = await extractFields(EXTRACTION_PROMPT, extractionContext);
-    extracted = result.extracted;
-    missing = result.missing;
-  } catch (err) {
-    console.error("[Conversation] Extraction failed:", err.message);
+  // Try local (zero-API) extraction first for simple field types
+  // This eliminates Groq rate limit errors for most messages
+  const { extracted: localResult, needsLLM } = localExtract(userMessage, currentGroup);
+
+  if (Object.keys(localResult).length > 0) {
+    console.log(`[LocalExtract] Extracted without LLM:`, localResult);
+    extracted = localResult;
+  } else if (needsLLM || currentGroup.some(f => f.type === 'multiselect')) {
+    // Fall back to Groq for complex/multi-field groups
+    const extractionContext = [
+      `Current section: ${section.name}`,
+      `Fields to extract:\n${buildFieldDefinitions(fieldsForExtraction)}`,
+      `Already collected: ${buildCollectedData(state, fieldsForExtraction)}`,
+      `User message: ${userMessage}`,
+    ].join("\n\n");
+
+    try {
+      const result = await extractFields(EXTRACTION_PROMPT, extractionContext);
+      extracted = result.extracted;
+      missing = result.missing;
+    } catch (err) {
+      console.error("[Conversation] Extraction failed:", err.message);
+    }
   }
 
-  // --- Smart Fallback for text/longtext fields ---
-  // If extraction returned nothing (rate limit, rigid LLM, or short answer like "kk", "??")
-  // and there's a single missing open-ended field, just store whatever the user said.
-  // This is the #1 fix for infinite loops.
+  // Final safety net: if everything failed and there's a single open-ended field,
+  // just store the raw message
   if (Object.keys(extracted).length === 0 && lowerMsg !== "skip") {
     const missingFields = getMissingFieldsInGroup(state);
     if (missingFields.length > 0) {
       const f = missingFields[0];
-      // For open-ended fields (text, longtext) — accept any non-trivial answer
       if ((f.type === "text" || f.type === "longtext") && userMessage.length >= 2) {
-        console.log(`[Fallback] Storing "${userMessage}" directly into field "${f.key}" (type: ${f.type})`);
+        console.log(`[Fallback] Raw store: "${userMessage}" → "${f.key}"`);
         extracted[f.key] = userMessage;
       }
     }
