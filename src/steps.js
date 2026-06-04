@@ -14,7 +14,7 @@ export const STEPS = [
   },
   {
     id: 'heightUnit', section: '1 of 13 — About You',
-    question: "What unit do you use for height?",
+    question: "Quick one — do you think in cm or feet/inches? 📏",
     type: 'buttons', key: 'heightUnit', options: ['cm', 'ft/in'],
   },
   {
@@ -25,7 +25,7 @@ export const STEPS = [
   },
   {
     id: 'weightUnit', section: '1 of 13 — About You',
-    question: "What unit do you use for weight?",
+    question: "And for weight — kg or lbs?",
     type: 'buttons', key: 'weightUnit', options: ['kg', 'lbs'],
   },
   {
@@ -42,7 +42,7 @@ export const STEPS = [
   },
   {
     id: 'sex', section: '1 of 13 — About You',
-    question: "What's your biological sex? This helps with calorie calculations.",
+    question: "Got it! One more basic — your biological sex? (helps me get your calories right)",
     type: 'buttons', key: 'sex', options: ['Male', 'Female', 'Other'],
   },
 
