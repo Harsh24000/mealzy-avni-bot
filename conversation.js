@@ -1,543 +1,1088 @@
-/**
- * @fileoverview Utility and helper functions for the Mealzy Telegram chatbot.
- * Provides typing simulation, message formatting, template rendering,
- * input sanitization, and other shared helpers.
- */
-
-import { InlineKeyboard } from "grammy";
+import SECTIONS from "./sections.js";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import {
+  SYSTEM_PROMPT,
+  EXTRACTION_PROMPT,
+  RESPONSE_PROMPT,
+  TRANSITION_PROMPT,
+  WELCOME_PROMPT,
+  SUMMARY_PROMPT,
+  PHOTO_PROMPT,
+} from "./prompts.js";
+import {
+  extractFields,
+  generateResponse,
+  generateTransition,
+  generateWelcome,
+  generateSummary,
+  transcribeAudio,
+} from "./llm.js";
+import {
+  simulateTyping,
+  calculateTypingDelay,
+  splitMessages,
+  fillTemplate,
+  formatSummaryForTelegram,
+  delay,
+  createOptionsKeyboard,
+  createSkipKeyboard,
+  buildProgressBar,
+  localExtract,
+  localResponse,
+} from "./utils.js";
 
 // ---------------------------------------------------------------------------
-// Timing helpers
+// Per-user conversation state store (in-memory)
 // ---------------------------------------------------------------------------
 
+/** @type {Map<number, UserState>} */
+const userStates = new Map();
+
 /**
- * Creates a promise that resolves after the specified duration.
- *
- * @param {number} ms - Duration in milliseconds to wait.
- * @returns {Promise<void>} Resolves when the delay has elapsed.
+ * @typedef {object} UserState
+ * @property {number}   chatId
+ * @property {number}   currentSectionIndex  - 0-based index into SECTIONS
+ * @property {number}   currentGroupIndex    - which field-group within the section
+ * @property {object}   data                 - all collected data keyed by field key
+ * @property {string[]} messageHistory       - recent messages for LLM context
+ * @property {string|null} awaitingPhoto     - which photo field we're waiting for
+ * @property {boolean}  completed            - whether onboarding is done
+ * @property {number}   startedAt
+ * @property {number}   lastActivity
  */
-export function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+
+const BOT_NAME = process.env.BOT_NAME || "Priya";
+const FORWARD_CHAT_ID = process.env.FORWARD_CHAT_ID || null;
+
+// Max messages to keep in history for LLM context
+const MAX_HISTORY = 12;
+
+// Per-user processing lock to prevent message storms
+// When the bot is mid-processing a message for a user, we block new ones
+const processingLocks = new Map();
+
+// ---------------------------------------------------------------------------
+// State helpers
+// ---------------------------------------------------------------------------
+
+function getState(chatId) {
+  if (!userStates.has(chatId)) {
+    userStates.set(chatId, {
+      chatId,
+      currentSectionIndex: 0,
+      currentGroupIndex: 0,
+      data: {},
+      messageHistory: [],
+      awaitingPhoto: null,
+      completed: false,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+      stateHistory: [],
+      nudgeSent: false,
+    });
+  }
+  const state = userStates.get(chatId);
+  state.lastActivity = Date.now();
+  return state;
 }
 
 /**
- * Sends the "typing" chat action and holds for {@link durationMs} milliseconds.
- *
- * Telegram's typing indicator expires after roughly 5 seconds, so for longer
- * durations the action is re-sent every 4 seconds to keep the indicator alive.
- *
- * @param {import('grammy').Context} ctx - grammY context object.
- * @param {number} durationMs - How long (ms) to keep the typing indicator up.
- * @returns {Promise<void>} Resolves once the full duration has elapsed.
+ * Returns users who have been inactive for more than `thresholdMs` and are
+ * not yet completed and haven't been nudged yet.
  */
-export async function simulateTyping(ctx, durationMs) {
-  const TYPING_REFRESH_INTERVAL = 4000; // resend before the ~5 s expiry
+export function getInactiveUsers(thresholdMs = 3 * 60 * 60 * 1000) {
+  const now = Date.now();
+  return [...userStates.values()].filter(
+    (s) => !s.completed && !s.nudgeSent && (now - s.lastActivity) > thresholdMs
+  );
+}
 
-  if (durationMs <= TYPING_REFRESH_INTERVAL) {
-    await ctx.api.sendChatAction(ctx.chat.id, "typing");
-    await delay(durationMs);
-    return;
-  }
+function resetState(chatId) {
+  userStates.delete(chatId);
+}
 
-  // Hyper-premium feature: The "Typing... Pausing... Typing..." Simulation
-  // For long messages (>4s), humans often type, pause to think, then type again.
-  // 1. Type for 2 seconds
-  await ctx.api.sendChatAction(ctx.chat.id, "typing");
-  await delay(2000);
-  
-  // 2. Pause (stop typing) for 1 second
-  // We can't actively "cancel" a typing status in Telegram easily without sending a message,
-  // but if we wait out the refresh or just let a short delay pass without renewing, it adds a natural bump.
-  // A better way: just do a hard delay. The typing action will naturally expire or stutter.
-  // Actually, let's just use delay and a brief gap.
-  await delay(1200);
-
-  // 3. Resume typing for the remainder
-  let remaining = durationMs - 3200;
-  if (remaining < 0) remaining = 500; // safety
-
-  while (remaining > 0) {
-    await ctx.api.sendChatAction(ctx.chat.id, "typing");
-    const wait = Math.min(TYPING_REFRESH_INTERVAL, remaining);
-    await delay(wait);
-    remaining -= wait;
+function addToHistory(state, role, text) {
+  state.messageHistory.push(`${role}: ${text}`);
+  if (state.messageHistory.length > MAX_HISTORY) {
+    state.messageHistory = state.messageHistory.slice(-MAX_HISTORY);
   }
 }
 
-/**
- * Calculates a realistic typing delay based on message length.
- *
- * The formula uses a base latency plus a per-character component that mimics
- * average human typing speed.  The result is clamped to a sensible range so
- * short messages don't feel instant and long messages don't stall the UX.
- *
- * @param {string} text - The message text whose length drives the delay.
- * @returns {number} Delay in milliseconds, between 1 000 and 4 000.
- */
-export function calculateTypingDelay(text) {
-  const BASE_MS = 800;
-  const PER_CHAR_MS = 35;
-  const MIN_DELAY = 1000;
-  const MAX_DELAY = 6000;
-
-  const raw = BASE_MS + (text?.length ?? 0) * PER_CHAR_MS;
-  return Math.max(MIN_DELAY, Math.min(MAX_DELAY, raw));
+function getCurrentSection(state) {
+  return SECTIONS[state.currentSectionIndex] ?? null;
 }
 
-// ---------------------------------------------------------------------------
-// Message formatting
-// ---------------------------------------------------------------------------
-
-/**
- * Splits a long message into chunks that respect Telegram's per-message limit.
- *
- * The function tries to break at the most natural boundary available:
- *   1. Paragraph breaks (`\n\n`)
- *   2. Sentence endings (`. `)
- *   3. Word boundaries (` `)
- *   4. Hard cut at {@link maxLength} as a last resort
- *
- * @param {string} text - The full message text to split.
- * @param {number} [maxLength=4000] - Maximum character count per chunk.
- * @returns {string[]} An array of message chunks, each within the limit.
- */
-export function splitMessages(text, maxLength = 4000) {
-  if (!text || text.length <= maxLength) {
-    return text ? [text] : [];
-  }
-
-  const chunks = [];
-  let remaining = text;
-
-  while (remaining.length > 0) {
-    // If what's left fits, push it and we're done.
-    if (remaining.length <= maxLength) {
-      chunks.push(remaining);
-      break;
-    }
-
-    const slice = remaining.slice(0, maxLength);
-    let splitIndex = -1;
-
-    // 1. Try paragraph boundary
-    splitIndex = slice.lastIndexOf("\n\n");
-
-    // 2. Fall back to sentence boundary
-    if (splitIndex === -1 || splitIndex < maxLength * 0.3) {
-      const sentenceIndex = slice.lastIndexOf(". ");
-      if (sentenceIndex > splitIndex) {
-        splitIndex = sentenceIndex + 1; // include the period
-      }
-    }
-
-    // 3. Fall back to word boundary
-    if (splitIndex === -1 || splitIndex < maxLength * 0.3) {
-      const wordIndex = slice.lastIndexOf(" ");
-      if (wordIndex > splitIndex) {
-        splitIndex = wordIndex;
-      }
-    }
-
-    // 4. Hard cut
-    if (splitIndex === -1 || splitIndex < maxLength * 0.1) {
-      splitIndex = maxLength;
-    }
-
-    chunks.push(remaining.slice(0, splitIndex).trimEnd());
-    remaining = remaining.slice(splitIndex).trimStart();
-  }
-
-  return chunks;
+function getCurrentGroup(state) {
+  const section = getCurrentSection(state);
+  if (!section || !section.grouping) return null;
+  return section.grouping[state.currentGroupIndex] ?? null;
 }
 
-// ---------------------------------------------------------------------------
-// Template engine
-// ---------------------------------------------------------------------------
+/**
+ * Get the field definitions for the current group of questions.
+ */
+function getCurrentGroupFields(state) {
+  const section = getCurrentSection(state);
+  const group = getCurrentGroup(state);
+  if (!section || !group) return [];
+  return section.fields.filter((f) => group.includes(f.key));
+}
 
 /**
- * Replaces `{placeholder}` tokens in a template string with values from a data
- * object.  Object and array values are serialised via `JSON.stringify`.
- *
- * @param {string} template - The template string containing `{key}` patterns.
- * @param {Record<string, unknown>} data - Key-value pairs for substitution.
- * @returns {string} The template with all matched placeholders replaced.
- *
- * @example
- * fillTemplate("Hello, {name}!", { name: "Chef" });
- * // => "Hello, Chef!"
+ * Check which fields in the current group are still missing.
  */
-export function fillTemplate(template, data) {
-  if (!template || !data) {
-    return template ?? "";
-  }
-
-  return template.replace(/\{(\w+)\}/g, (_match, key) => {
-    const value = data[key];
-
-    if (value === undefined || value === null) {
-      return `{${key}}`; // leave unresolved placeholders as-is
-    }
-
-    if (typeof value === "object") {
-      return JSON.stringify(value);
-    }
-
-    return String(value);
+function getMissingFieldsInGroup(state) {
+  const fields = getCurrentGroupFields(state);
+  return fields.filter((f) => {
+    const val = state.data[f.key];
+    return val === undefined || val === null || val === "";
   });
 }
 
-// ---------------------------------------------------------------------------
-// Telegram HTML helpers
-// ---------------------------------------------------------------------------
-
 /**
- * Escapes the five HTML special characters so the string can be safely embedded
- * in Telegram HTML-formatted messages.
- *
- * @param {string} text - Raw text to escape.
- * @returns {string} HTML-safe text.
+ * Check if all required fields in the current section are collected.
  */
-export function escapeHtml(text) {
-  if (!text) return "";
+function isSectionComplete(state) {
+  const section = getCurrentSection(state);
+  if (!section) return true;
+  if (section.id === "review-submit") return true;
 
-  const replacements = {
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#x27;",
-  };
-
-  return text.replace(/[&<>"']/g, (ch) => replacements[ch]);
-}
-
-/**
- * Formats the collected conversation data into a pretty Telegram-compatible
- * HTML summary, organised by section.
- *
- * Sections whose fields are all empty / null / undefined are omitted entirely.
- *
- * @param {Record<string, unknown>} sectionData - Collected user data keyed by
- *   field name (e.g. `{ servings: "4", cuisine: "Italian" }`).
- * @param {Array<{ title: string, fields: Array<{ key: string, label: string }> }>} sections
- *   An ordered list of section definitions, each with a `title` and an array of
- *   `fields` containing `key` (data lookup) and `label` (display name).
- * @returns {string} A formatted HTML string ready for Telegram's `parse_mode: "HTML"`.
- *
- * @example
- * formatSummaryForTelegram(
- *   { servings: "4", cuisine: "Italian", allergies: null },
- *   [
- *     { title: "Basics", fields: [
- *       { key: "servings", label: "Servings" },
- *       { key: "cuisine",  label: "Cuisine"  },
- *     ]},
- *     { title: "Dietary", fields: [
- *       { key: "allergies", label: "Allergies" },
- *     ]},
- *   ],
- * );
- * // => "<b>📋 Your Meal Plan Summary</b>\n\n<b>Basics</b>\n• Servings: 4\n• Cuisine: Italian"
- */
-export function formatSummaryForTelegram(sectionData, sections) {
-  if (!sectionData || !sections) return "";
-
-  const sectionIcons = {
-    'about-you':           '👤',
-    'diet-food':           '🥗',
-    'your-day':            '🗓',
-    'health':              '🏥',
-    'supplements-habits':  '💊',
-    'sleep-stress':        '😴',
-    'fitness':             '🏋️',
-    'food-cooking':        '🥘',
-    'your-goals':          '🎯',
-    'commitment':          '❤️',
-    'full-body-photos':    '📸',
-    'daily-activity':      '🚶',
-    'review-submit':       '✅',
-  };
-
-  const parts = [
-    `🌿 <b>Mealzy — Client Profile</b>`,
-    `────────────────────────`,
-  ];
-
-  for (const section of sections) {
-    if (section.id === 'review-submit') continue;
-
-    const lines = [];
-    for (const field of section.fields ?? []) {
-      const value = sectionData[field.key];
-      if (value === undefined || value === null || value === "") continue;
-
-      let displayValue = typeof value === "object" ? JSON.stringify(value) : String(value);
-      // Format booleans nicely
-      if (displayValue === "true") displayValue = "Yes ✅";
-      if (displayValue === "false") displayValue = "No ❌";
-
-      lines.push(`  • <b>${escapeHtml(field.question || field.key)}</b>\n    ${escapeHtml(displayValue)}`);
-    }
-
-    if (lines.length > 0) {
-      const icon = sectionIcons[section.id] ?? '🔵';
-      parts.push(`${icon} <b>${escapeHtml(section.name)}</b>\n${lines.join("\n")}`);
+  for (const field of section.fields) {
+    if (field.required && (state.data[field.key] === undefined || state.data[field.key] === null)) {
+      return false;
     }
   }
-
-  parts.push(`────────────────────────`);
-  parts.push(`<i>Generated by Mealzy Onboarding Bot</i>`);
-
-  return parts.join("\n\n");
+  return true;
 }
-
-// ---------------------------------------------------------------------------
-// Local response generation (zero API calls for simple field acknowledgements)
-// ---------------------------------------------------------------------------
 
 /**
- * Generates a warm, natural-sounding acknowledgement + next question
- * for simple single-field responses, without any LLM call.
- *
- * Returns null if the situation is too complex for a local response
- * (in which case, the caller should use Groq).
- *
- * @param {string}  userName       - The user's first name (or null)
- * @param {Object}  justExtracted  - Fields just extracted { key: value }
- * @param {Array}   nextFields     - Missing fields still to collect
- * @param {Object}  allData        - Full collected profile so far
- * @returns {string|null}
+ * Check if all fields in the current group are collected (required + optional attempted).
  */
-export function localResponse(userName, justExtracted, nextFields, allData) {
-  const name = userName ? userName.split(' ')[0] : null;
-  const extractedKeys = Object.keys(justExtracted);
+function isGroupComplete(state) {
+  const fields = getCurrentGroupFields(state);
+  if (fields.length === 0) return true;
 
-  // Only handle single-field extractions
-  if (extractedKeys.length !== 1) return null;
-
-  const key = extractedKeys[0];
-  const value = justExtracted[key];
-  const next = nextFields[0];
-
-  // Acknowledgement phrases (randomised so it doesn't feel canned)
-  const acks = {
-    fullName: () => {
-      const n = String(value).split(' ')[0];
-      return pick([`nice to meet you, ${n}!`, `hey ${n}!`, `${n}, love it.`, `oh cool, ${n}!`]);
-    },
-    age: () => {
-      const v = parseInt(value);
-      if (v < 20) return pick(["oh nice, young and ambitious!", "love the energy!"]);
-      if (v > 40) return pick(["awesome, honestly the best time to start.", "respect, seriously."]);
-      return pick(["cool!", "nice.", "got it!"]);
-    },
-    heightCm: () => pick(["got it!", "noted!", "cool."]),
-    weightKg: () => pick(["ok!", "noted.", "got it."]),
-    profession: () => {
-      const v = String(value).toLowerCase();
-      if (v.includes("student")) return "ah student life! respect the hustle.";
-      if (v.includes("engineer") || v.includes("software") || v.includes("dev")) return "oh nice, a dev — you probably sit a lot huh?";
-      if (v.includes("doctor") || v.includes("nurse")) return "wow, respect — you must be exhausted a lot.";
-      return pick(["oh interesting!", "nice!", "cool."]);
-    },
-    biologicalSex: () => "",
-    default: () => pick(["ok!", "got it.", "noted!", "nice."]),
-  };
-
-  const ackFn = acks[key] || acks.default;
-  const ack = ackFn();
-
-  // If no next field, just acknowledge
-  if (!next) return ack.trim() || null;
-
-  // Build the next question naturally
-  const questions = {
-    age:          () => pick(["how old are you?", "and your age?"]),
-    heightCm:     () => pick(["how tall are you? (in cm)", "what's your height in cm?"]),
-    weightKg:     () => pick(["and your current weight in kg?", "what do you weigh right now? (kg)"]),
-    profession:   () => pick(["what do you do for work?", "and what's your profession?"]),
-    biologicalSex:() => null, // handled by keyboard, skip
-    dailyRoutine: () => pick(["walk me through a typical weekday for you — like from morning to night?", "what does a normal weekday look like for you?"]),
-    currentDiet:  () => pick(["what does your food look like on a typical day?", "walk me through what you usually eat in a day?"]),
-    averageWeekend:() => pick(["and weekends — what do those usually look like?", "how do you spend a typical weekend?"]),
-  };
-
-  const qFn = questions[next.key];
-  const q = qFn ? qFn() : null;
-
-  // If the next field has options (select), let the keyboard handle it
-  if (next.options && next.options.length > 0) return ack.trim() || null;
-
-  if (!q) return ack.trim() || null;
-
-  const parts = [ack, q].filter(Boolean);
-  return parts.join(' ').trim();
+  // A group is complete if all required fields are filled
+  // Optional fields are considered done after the user has responded to the group's question
+  const requiredFields = fields.filter((f) => f.required);
+  return requiredFields.every((f) => {
+    const val = state.data[f.key];
+    return val !== undefined && val !== null && val !== "";
+  });
 }
-
-/** Pick a random item from an array */
-function pick(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
-// ---------------------------------------------------------------------------
-// Local extraction (zero API calls for simple field types)
-// ---------------------------------------------------------------------------
 
 /**
- * Tries to extract field values from a user message using pure code logic,
- * without any LLM API call. Returns an object of extracted fields.
- *
- * This is called BEFORE the LLM extractor to handle simple cases and save
- * on API quota. Only falls back to LLM for multi-field or longtext extractions.
- *
- * @param {string} message - Raw user message
- * @param {Array}  fields  - Array of field definitions to try extracting
- * @returns {{ extracted: Object, needsLLM: boolean }}
+ * Move to the next group or the next section.
+ * Returns 'next-group' | 'next-section' | 'complete'
  */
-export function localExtract(message, fields) {
-  const extracted = {};
-  const msg = message.trim();
-  const lower = msg.toLowerCase();
-  let needsLLM = false;
+function advance(state) {
+  const section = getCurrentSection(state);
+  if (!section) return "complete";
 
-  // Only handle single-field groups locally
-  if (fields.length > 2) {
-    needsLLM = true;
-    return { extracted, needsLLM };
+  // Try next group in the current section
+  if (section.grouping && state.currentGroupIndex < section.grouping.length - 1) {
+    state.currentGroupIndex++;
+    return "next-group";
   }
 
-  for (const field of fields) {
-    switch (field.type) {
-      case "number": {
-        // Extract the first number found in the message
-        const numMatch = msg.match(/\b(\d+(?:\.\d+)?)\s*(?:kg|kgs|cm|lbs|lb|years?)?\b/i);
-        if (numMatch) {
-          extracted[field.key] = parseFloat(numMatch[1]);
-        }
-        break;
-      }
+  // Move to next section
+  if (state.currentSectionIndex < SECTIONS.length - 1) {
+    state.currentSectionIndex++;
+    state.currentGroupIndex = 0;
+    return "next-section";
+  }
 
-      case "text": {
-        // For text fields, the entire message IS the answer
-        if (msg.length >= 1) {
-          extracted[field.key] = msg;
-        }
-        break;
-      }
+  state.completed = true;
+  return "complete";
+}
 
-      case "yesno": {
-        const yesWords = ["yes", "yeah", "yep", "yup", "sure", "definitely", "absolutely", "of course", "haan", "ha", "correct", "true", "y", "👍"];
-        const noWords  = ["no", "nope", "nah", "never", "not", "nahi", "na", "n", "false", "👎"];
-        if (yesWords.some(w => lower === w || lower.startsWith(w + " ") || lower.endsWith(" " + w))) {
-          extracted[field.key] = true;
-        } else if (noWords.some(w => lower === w || lower.startsWith(w + " ") || lower.endsWith(" " + w))) {
-          extracted[field.key] = false;
-        }
-        break;
-      }
+// ---------------------------------------------------------------------------
+// Build context strings for LLM prompts
+// ---------------------------------------------------------------------------
 
-      case "select": {
-        // Fuzzy match against options
-        if (field.options && field.options.length > 0) {
-          const match = field.options.find(opt =>
-            lower.includes(opt.toLowerCase()) ||
-            opt.toLowerCase().includes(lower)
-          );
-          if (match) extracted[field.key] = match;
-        }
-        break;
-      }
+function buildFieldDefinitions(fields) {
+  return fields
+    .map((f) => {
+      let def = `- ${f.key} (${f.type}): "${f.question}"`;
+      if (f.options) def += ` | Options: ${JSON.stringify(f.options)}`;
+      if (f.examples) def += ` | Example: ${f.examples}`;
+      return def;
+    })
+    .join("\n");
+}
 
-      case "scale": {
-        const scaleMatch = msg.match(/\b([1-9]|10)\b/);
-        if (scaleMatch) {
-          extracted[field.key] = parseInt(scaleMatch[1], 10);
-        }
-        break;
-      }
-
-      case "longtext": {
-        // Accept any message >= 3 chars as a longtext answer
-        if (msg.length >= 3) {
-          extracted[field.key] = msg;
-        }
-        break;
-      }
-
-      default:
-        needsLLM = true;
+function buildCollectedData(state, fields) {
+  const collected = {};
+  for (const f of fields) {
+    if (state.data[f.key] !== undefined && state.data[f.key] !== null) {
+      collected[f.key] = state.data[f.key];
     }
   }
+  return JSON.stringify(collected);
+}
 
-  return { extracted, needsLLM };
+function buildUserProfile(state) {
+  const profile = {};
+  for (const [key, val] of Object.entries(state.data)) {
+    if (val !== undefined && val !== null && val !== "") {
+      profile[key] = val;
+    }
+  }
+  return JSON.stringify(profile, null, 2);
+}
+
+function buildConversationHistory(state, count = 6) {
+  return state.messageHistory.slice(-count).join("\n");
 }
 
 // ---------------------------------------------------------------------------
-// Input sanitisation
+// Core message handlers
 // ---------------------------------------------------------------------------
 
 /**
- * Sanitises user input by trimming whitespace and stripping potentially
- * harmful characters (control chars, zero-width chars, etc.).
- *
- * @param {string} text - Raw user input.
- * @returns {string} Cleaned string safe for further processing.
+ * Handle the /start command.
  */
-export function sanitizeInput(text) {
-  if (!text) return "";
+export async function handleStart(ctx) {
+  const chatId = ctx.chat.id;
+  resetState(chatId);
+  const state = getState(chatId);
 
-  return (
-    text
-      // Trim leading / trailing whitespace
-      .trim()
-      // Remove ASCII control characters (0x00–0x1F) except common whitespace
-      // eslint-disable-next-line no-control-regex
-      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-      // Remove zero-width / invisible Unicode characters
-      .replace(/[\u200B-\u200D\uFEFF\u2060]/g, "")
-      // Collapse multiple consecutive spaces into one
-      .replace(/ {2,}/g, " ")
+  // Generate welcome message via LLM
+  const welcomePrompt = fillTemplate(WELCOME_PROMPT, { 
+    botName: BOT_NAME,
+    currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute:'2-digit' })
+  });
+
+  await simulateTyping(ctx, 1500);
+  let welcomeMsg;
+  try {
+    welcomeMsg = await generateWelcome(welcomePrompt);
+  } catch {
+    welcomeMsg = `Hey there! 👋 I'm ${BOT_NAME} from Mealzy.\n\nI'm here to get to know you a bit so we can create your perfect nutrition and fitness plan. Think of this as a quick, casual chat — no boring forms, promise!\n\nLet's start simple — what's your name?`;
+  }
+
+  await sendBotMessage(ctx, state, welcomeMsg);
+}
+
+
+/**
+ * Handle the /restart command.
+ */
+export async function handleRestart(ctx) {
+  const chatId = ctx.chat.id;
+  resetState(chatId);
+  await ctx.reply("No worries, let's start fresh! 🔄");
+  await handleStart(ctx);
+}
+
+/**
+ * Handle the /help command.
+ */
+export async function handleHelp(ctx) {
+  await ctx.reply(
+    `🤖 <b>Here's what you can do:</b>\n\n` +
+    `▶️ /start — Begin onboarding\n` +
+    `📊 /status — See your progress\n` +
+    `↩️ /undo — Undo your last answer\n` +
+    `🔄 /restart — Start over from scratch\n` +
+    `❓ /help — Show this menu\n\n` +
+    `You can also send a 🎙 <b>voice note</b> instead of typing any answer!`,
+    { parse_mode: "HTML" }
   );
 }
 
 /**
- * Creates an InlineKeyboard for select/multiselect fields.
- * @param {string} fieldKey - The field identifier
- * @param {string[]} options - The array of string options
+ * Handle the /status command — show progress.
  */
-export function createOptionsKeyboard(fieldKey, options) {
-  const keyboard = new InlineKeyboard();
-  options.forEach((opt, idx) => {
-    keyboard.text(opt, `ans_${fieldKey}_${idx}`);
-    if (idx % 2 === 1) keyboard.row(); // 2 buttons per row
-  });
+export async function handleStatus(ctx) {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+
+  if (state.completed) {
+    await ctx.reply(
+      `🎉 <b>Onboarding Complete!</b>\n\nYou've finished all sections. Your coach will be in touch within 24 hours.\n\nType /restart if you need to redo anything.`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const current = getCurrentSection(state);
+  const totalSections = SECTIONS.filter(s => s.id !== 'review-submit').length;
+  const completedCount = state.currentSectionIndex;
+  const progress = Math.round((completedCount / totalSections) * 100);
+  const progressBar = buildProgressBar(completedCount, totalSections);
+
+  const sectionIcons = [
+    '👤', '🥗', '🗓', '🏥', '💊', '😴', '🏋️', '🥘', '🎯', '❤️', '📸', '🚶', '✅'
+  ];
+
+  const sectionLines = SECTIONS
+    .filter(s => s.id !== 'review-submit')
+    .map((s, i) => {
+      const icon = sectionIcons[i] ?? '🔵';
+      if (i < completedCount) return `✅ <s>${s.name}</s>`;
+      if (i === completedCount) return `▶️ <b>${s.name}</b> ← you are here`;
+      return `⚪️ ${s.name}`;
+    }).join('\n');
+
+  await ctx.reply(
+    `📊 <b>Your Mealzy Progress</b>\n\n` +
+    `${progressBar} <b>${progress}%</b>\n` +
+    `Section ${completedCount} of ${totalSections} complete\n\n` +
+    `<b>Sections:</b>\n${sectionLines}\n\n` +
+    `💡 Tip: Send a voice note to answer faster!`,
+    { parse_mode: 'HTML' }
+  );
+}
+
+/**
+ * Handle an incoming text message during onboarding.
+ */
+export async function handleMessage(ctx) {
+  const userMessage = ctx.message?.text?.trim();
+  if (!userMessage) return;
+  await processUserMessage(ctx, userMessage);
+}
+
+/**
+ * Core logic for processing a user's text input
+ */
+export async function processUserMessage(ctx, userMessage) {
+  const chatId = ctx.chat.id;
+
+  // IMMEDIATELY show typing indicator so the bot feels instantly responsive
+  ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+
+  // Processing lock — if we're already handling a message for this user, silently drop new ones
+  // This prevents the message storm when the API is slow
+  if (processingLocks.get(chatId)) {
+    console.log(`[Lock] Dropping duplicate message from ${chatId}: "${userMessage}"`);
+    return;
+  }
+  processingLocks.set(chatId, true);
+
+  try {
+    await _processUserMessageInner(ctx, chatId, userMessage);
+  } finally {
+    processingLocks.delete(chatId);
+  }
+}
+
+/**
+ * Inner core logic — only runs when lock is held.
+ */
+async function _processUserMessageInner(ctx, chatId, userMessage) {
+  const state = getState(chatId);
+
+  // If completed, tell them
+  if (state.completed) {
+    await ctx.reply("You've already completed the onboarding! 🎉\nType /restart if you want to do it again.");
+    return;
+  }
+
+  // If we're awaiting a photo, remind them
+  if (state.awaitingPhoto) {
+    await simulateTyping(ctx, 800);
+    await ctx.reply(`I'm waiting for your ${state.awaitingPhoto.replace(/([A-Z])/g, " $1").toLowerCase().replace("photo ", "")} photo 📸\n\nJust send it as a photo and I'll save it!`);
+    return;
+  }
+
+  // Handle "BRB" protocol
+  const lowerMsg = userMessage.toLowerCase();
+  const brbPhrases = ["brb", "be right back", "need to go", "hold on", "give me a sec", "pause", "g2g", "gtg", "1 min", "wait"];
+  if (brbPhrases.some(p => lowerMsg === p || lowerMsg.startsWith(p))) {
+    state.nudgeSent = true; // Disable nudge
+    await simulateTyping(ctx, 1000);
+    await ctx.reply("no stress at all, take your time! just say 'hi' when you're back.");
+    return;
+  }
+
+  // Handle "skip" text
+  if (lowerMsg === "skip") {
+    const missing = getMissingFieldsInGroup(state);
+    if (missing.length > 0) {
+      if (!missing[0].required) {
+        state.data[missing[0].key] = "Skipped";
+        addToHistory(state, "User", "[Skipped]");
+      } else {
+        await simulateTyping(ctx, 1000);
+        await ctx.reply(`I actually really need this one to create your plan! Tell me even a little bit 🙏\n\n${missing[0].question}`);
+        return;
+      }
+    }
+  }
+
+  addToHistory(state, "User", userMessage);
+
+  const section = getCurrentSection(state);
+  if (!section) {
+    await ctx.reply("Something went wrong. Type /restart to start over.");
+    return;
+  }
+
+  // Handle the Review & Submit section
+  if (section.id === "review-submit") {
+    await handleReviewResponse(ctx, state, userMessage);
+    return;
+  }
+
+  // --- Step 1: Extract fields from the user's message ---
+  const groupFields = getCurrentGroupFields(state);
+  const allSectionFields = section.fields.filter((f) => f.type !== "photo");
+  const fieldsForExtraction = allSectionFields.length > 0 ? allSectionFields : groupFields;
+  const currentGroup = getMissingFieldsInGroup(state);
+
+  let extracted = {};
+  let missing = [];
+
+  // Try local (zero-API) extraction first for simple field types
+  // This eliminates Groq rate limit errors for most messages
+  const { extracted: localResult, needsLLM } = localExtract(userMessage, currentGroup);
+
+  if (Object.keys(localResult).length > 0) {
+    console.log(`[LocalExtract] Extracted without LLM:`, localResult);
+    extracted = localResult;
+  } else if (needsLLM || currentGroup.some(f => f.type === 'multiselect')) {
+    // Fall back to Groq for complex/multi-field groups
+    const extractionContext = [
+      `Current section: ${section.name}`,
+      `Fields to extract:\n${buildFieldDefinitions(fieldsForExtraction)}`,
+      `Already collected: ${buildCollectedData(state, fieldsForExtraction)}`,
+      `User message: ${userMessage}`,
+    ].join("\n\n");
+
+    try {
+      const result = await extractFields(EXTRACTION_PROMPT, extractionContext);
+      extracted = result.extracted;
+      missing = result.missing;
+    } catch (err) {
+      console.error("[Conversation] Extraction failed:", err.message);
+    }
+  }
+
+  // Final safety net: if everything failed and there's a single open-ended field,
+  // just store the raw message
+  if (Object.keys(extracted).length === 0 && lowerMsg !== "skip") {
+    const missingFields = getMissingFieldsInGroup(state);
+    if (missingFields.length > 0) {
+      const f = missingFields[0];
+      if ((f.type === "text" || f.type === "longtext") && userMessage.length >= 2) {
+        console.log(`[Fallback] Raw store: "${userMessage}" → "${f.key}"`);
+        extracted[f.key] = userMessage;
+      }
+    }
+  }
+
+  // --- Step 2: Store extracted fields ---
+  if (Object.keys(extracted).length > 0) {
+    // Save snapshot for /undo feature
+    state.stateHistory.push({
+      currentSectionIndex: state.currentSectionIndex,
+      currentGroupIndex: state.currentGroupIndex,
+      data: JSON.parse(JSON.stringify(state.data)),
+      awaitingPhoto: state.awaitingPhoto,
+      completed: state.completed,
+    });
+  }
+
+  for (const [key, value] of Object.entries(extracted)) {
+    if (value !== null && value !== undefined && value !== "") {
+      state.data[key] = value;
+    }
+  }
+
+  // --- Step 3: Decide what to do next ---
+
+  // Auto-advance through groups if the current group is complete
+  while (isGroupComplete(state)) {
+    const section = getCurrentSection(state);
+    if (!section) break;
+
+    // Check if section is complete (all required fields)
+    if (isSectionComplete(state)) {
+      const advancement = advance(state);
+
+      if (advancement === "complete") {
+        // Show the final review
+        await showReview(ctx, state);
+        return;
+      }
+
+      if (advancement === "next-section") {
+        // Generate transition message to next section (the LLM handles this naturally)
+        const nextSection = getCurrentSection(state);
+
+        // Special handling for photo section
+        if (nextSection?.id === "full-body-photos") {
+          await sendPhotoSectionIntro(ctx, state);
+          return;
+        }
+
+        // Special handling for review section
+        if (nextSection?.id === "review-submit") {
+          await showReview(ctx, state);
+          return;
+        }
+
+        const nextGroupFields = getCurrentGroupFields(state);
+        const transitionContext = fillTemplate(TRANSITION_PROMPT, {
+          botName: BOT_NAME,
+          fromSection: section.name,
+          toSection: nextSection.name,
+          toSectionDescription: nextSection.description,
+          userProfile: buildUserProfile(state),
+          conversationHistory: buildConversationHistory(state, 4),
+          firstQuestions: buildFieldDefinitions(nextGroupFields),
+        });
+
+        await simulateTyping(ctx, calculateTypingDelay("transition message"));
+        let transitionMsg;
+        try {
+          transitionMsg = await generateTransition(transitionContext, "Generate the transition message.");
+        } catch {
+          // Fallback transitions — human sounding
+          const fallbacks = [
+            `okay cool, we're done with that bit! now let's get into ${nextSection.name.toLowerCase()}.`,
+            `nice, all good there. moving on — ${nextSection.name.toLowerCase()} next.`,
+            `alright! let's shift to ${nextSection.name.toLowerCase()} now.`,
+          ];
+          transitionMsg = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+        }
+
+        await sendBotMessage(ctx, state, transitionMsg);
+        return;
+      }
+
+      // next-group within same section — continue the loop
+      continue;
+    }
+
+    // Section not complete but group is — move to next group
+    if (section.grouping && state.currentGroupIndex < section.grouping.length - 1) {
+      state.currentGroupIndex++;
+    } else {
+      break; // No more groups, but section not complete (shouldn't happen normally)
+    }
+  }
+
+  // --- Step 4: Generate conversational response for remaining fields ---
+  const currentMissing = getMissingFieldsInGroup(state);
+
+  let keyboard = null;
+  if (currentMissing.length > 0 && currentMissing[0].options && currentMissing[0].options.length <= 12) {
+    keyboard = createOptionsKeyboard(currentMissing[0].key, currentMissing[0].options);
+  } else if (currentMissing.length > 0 && !currentMissing[0].required) {
+    keyboard = createSkipKeyboard();
+  }
+
+  // Try local response first (zero API calls) — only use Groq for complex cases
+  const userName = state.data.fullName || null;
+  const localMsg = localResponse(userName, extracted, currentMissing, state.data);
+
+  let response;
+  if (localMsg && !keyboard) {
+    // Perfect — we have a human-sounding local response, no Groq needed
+    console.log(`[LocalResponse] Responding without LLM: "${localMsg}"`);
+    response = localMsg;
+  } else {
+    // Use Groq for complex sections (food preferences, goals, stress, etc.)
+    const responseContext = fillTemplate(RESPONSE_PROMPT, {
+      botName: BOT_NAME,
+      sectionName: section.name,
+      sectionDescription: section.description,
+      extractedFields: JSON.stringify(extracted),
+      missingFields: buildFieldDefinitions(currentMissing),
+      userProfile: buildUserProfile(state),
+      conversationHistory: buildConversationHistory(state),
+      currentTime: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute:'2-digit' })
+    });
+
+    await simulateTyping(ctx, calculateTypingDelay("response"));
+
+    try {
+      response = await generateResponse(responseContext, "Generate your next message.");
+    } catch (err) {
+      console.error("[Response] generateResponse failed:", err.message);
+      // Retry once after 2s
+      try {
+        await delay(2000);
+        response = await generateResponse(responseContext, "Generate your next message.");
+      } catch {
+        // Final fallback — human-sounding, never robotic
+        const fallbacks = [
+          "sorry give me a sec...",
+          "hmm one moment",
+          "hang on...",
+        ];
+        response = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+        if (currentMissing.length > 0 && !currentMissing[0].options) {
+          const q = currentMissing[0].question.toLowerCase().replace(/[?.!]$/, '');
+          response = `${response} so — ${q}?`;
+        }
+      }
+    }
+  }
+
+  await sendBotMessage(ctx, state, response, keyboard);
+}
+
+/**
+ * Handle an incoming photo message.
+ */
+export async function handlePhoto(ctx) {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+
+  if (!state.awaitingPhoto) {
+    await simulateTyping(ctx, 600);
+    await ctx.reply("Thanks for the photo! But I'm not expecting one right now 😅\nLet's continue our chat!");
+    return;
+  }
+
+  // Get the largest photo (best quality)
+  const photos = ctx.message?.photo;
+  if (!photos || photos.length === 0) {
+    await ctx.reply("Hmm, I couldn't get that photo. Could you try sending it again?");
+    return;
+  }
+
+  const bestPhoto = photos[photos.length - 1];
+  const photoKey = state.awaitingPhoto;
+
+  // Store the file_id
+  state.data[photoKey] = bestPhoto.file_id;
+  state.awaitingPhoto = null;
+
+  addToHistory(state, "User", `[Sent ${photoKey} photo]`);
+
+  // Determine next photo to ask for
+  const photoFields = ["photoFront", "photoBack", "photoLeftSide", "photoRightSide"];
+  const currentPhotoIndex = photoFields.indexOf(photoKey);
+  const nextPhotoIndex = currentPhotoIndex + 1;
+
+  if (nextPhotoIndex < photoFields.length) {
+    // Ask for the next photo
+    const nextPhotoKey = photoFields[nextPhotoIndex];
+    state.awaitingPhoto = nextPhotoKey;
+
+    await simulateTyping(ctx, 1000);
+    const msg = PHOTO_PROMPT(nextPhotoKey);
+    await sendBotMessage(ctx, state, msg);
+  } else {
+    // All photos collected — move on
+    await simulateTyping(ctx, 1000);
+    await sendBotMessage(ctx, state, "All 4 photos received! 📸 You're doing great, almost there!");
+
+    // Advance past the photo section
+    const advancement = advance(state);
+    if (advancement === "next-section") {
+      const nextSection = getCurrentSection(state);
+      if (nextSection?.id === "review-submit") {
+        await showReview(ctx, state);
+        return;
+      }
+
+      const nextGroupFields = getCurrentGroupFields(state);
+
+      await simulateTyping(ctx, 1500);
+      let transitionMsg;
+      try {
+        const transitionContext = fillTemplate(TRANSITION_PROMPT, {
+          botName: BOT_NAME,
+          fromSection: "Full Body Photos",
+          toSection: nextSection.name,
+          toSectionDescription: nextSection.description,
+          userProfile: buildUserProfile(state),
+          conversationHistory: buildConversationHistory(state, 4),
+          firstQuestions: buildFieldDefinitions(nextGroupFields),
+        });
+        transitionMsg = await generateTransition(transitionContext, "Generate transition.");
+      } catch {
+        transitionMsg = `Awesome, photos are saved! Now just a few quick questions about your daily activity...`;
+      }
+      await sendBotMessage(ctx, state, transitionMsg);
+    } else if (advancement === "complete") {
+      await showReview(ctx, state);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Photo section handling
+// ---------------------------------------------------------------------------
+
+async function sendPhotoSectionIntro(ctx, state) {
+  await simulateTyping(ctx, 1500);
+  const introMsg =
+    `Alright, now I need 4 full-body photos from you 📸\n\n` +
+    `Stand at arm's length and take full-length photos. Don't worry — these are completely private, only you and your coach can see them.\n\n` +
+    `Let's start with a *front-facing* photo. Stand naturally, arms at your sides.`;
+
+  state.awaitingPhoto = "photoFront";
+  await ctx.reply(introMsg, { parse_mode: "Markdown" });
+  addToHistory(state, "Bot", introMsg);
+}
+
+// ---------------------------------------------------------------------------
+// Review & Submit handling
+// ---------------------------------------------------------------------------
+
+async function showReview(ctx, state) {
+  state.currentSectionIndex = SECTIONS.length - 1; // Set to review section
+  state.currentGroupIndex = 0;
+
+  await simulateTyping(ctx, 2000);
+
+  // Generate a formatted summary
+  const summary = formatSummaryForTelegram(state.data, SECTIONS);
+  const messages = splitMessages(summary, 4000);
+
+  await ctx.reply("That's everything! Here's a summary of what you've told me 👇", { parse_mode: "Markdown" });
+  await delay(800);
+
+  for (const msg of messages) {
+    await simulateTyping(ctx, 1000);
+    try {
+      await ctx.reply(msg, { parse_mode: "HTML" });
+    } catch {
+      // If HTML parsing fails, send as plain text
+      await ctx.reply(msg);
+    }
+    await delay(500);
+  }
+
+  await delay(600);
+  await ctx.reply(
+    "Does everything look good? ✅\n\n" +
+    "Just say *yes* to confirm, or tell me what you'd like to change!",
+    { parse_mode: "Markdown" }
+  );
+
+  addToHistory(state, "Bot", "[Showed onboarding summary and asked for confirmation]");
+}
+
+async function handleReviewResponse(ctx, state, userMessage) {
+  const lower = userMessage.toLowerCase();
+  const positiveWords = ["yes", "yeah", "yep", "looks good", "perfect", "confirm", "submit", "done", "ok", "okay", "haan", "ha", "sahi hai", "theek hai", "👍", "all good"];
+
+  if (positiveWords.some((w) => lower.includes(w))) {
+    // Confirmed! Mark as completed
+    state.completed = true;
+
+    await simulateTyping(ctx, 1200);
+
+    // Premium completion experience
+    const firstName = (state.data.fullName || "").split(" ")[0] || "";
+    await ctx.reply(
+      `🎉 <b>You're all set, ${firstName}!</b>\n\n` +
+      `That's a wrap on your onboarding. Here's what happens next:\n\n` +
+      `<b>Within 24 hours</b>\n` +
+      `📋 Your coach reviews your full profile\n\n` +
+      `<b>Within 48 hours</b>\n` +
+      `🥗 Your personalised meal plan is ready\n` +
+      `🏋️ Your custom workout plan drops\n\n` +
+      `<b>Day 1 of your plan</b>\n` +
+      `📱 Check-in reminder from your coach\n\n` +
+      `In the meantime — start tomorrow:\n` +
+      `💧 Drink <b>3 litres of water</b> every day. It's the single highest-ROI thing you can do right now.\n\n` +
+      `Welcome to the Mealzy family! 💚`,
+      { parse_mode: "HTML" }
+    );
+    
+    // Warm follow up 5 seconds later
+    await delay(5000);
+    await ctx.reply(`I'll be right here if you need anything else before your plan drops. Go get some rest! 😌`);
+
+    // Forward the completed data if FORWARD_CHAT_ID is set
+    if (FORWARD_CHAT_ID) {
+      try {
+        const summary = formatSummaryForTelegram(state.data, SECTIONS);
+        const header = `🆕 <b>New Onboarding Completed</b>\nUser: ${state.data.fullName || "Unknown"}\nTelegram ID: ${ctx.chat.id}\nDate: ${new Date().toLocaleString("en-IN")}\n\n`;
+        const messages = splitMessages(header + summary, 4000);
+
+        for (const msg of messages) {
+          try {
+            await ctx.api.sendMessage(FORWARD_CHAT_ID, msg, { parse_mode: "HTML" });
+          } catch {
+            await ctx.api.sendMessage(FORWARD_CHAT_ID, msg);
+          }
+        }
+
+        // Forward photos if collected
+        const photoKeys = ["photoFront", "photoBack", "photoLeftSide", "photoRightSide"];
+        for (const key of photoKeys) {
+          if (state.data[key]) {
+            try {
+              const label = key.replace("photo", "").replace(/([A-Z])/g, " $1").trim();
+              await ctx.api.sendPhoto(FORWARD_CHAT_ID, state.data[key], {
+                caption: `📸 ${label} — ${state.data.fullName || "User"}`,
+              });
+            } catch (err) {
+              console.error(`[Forward] Failed to forward photo ${key}:`, err.message);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[Forward] Failed to forward onboarding data:", err.message);
+      }
+    }
+
+    addToHistory(state, "Bot", "[Onboarding completed and confirmed]");
+  } else {
+    // User wants to change something — try to handle it
+    await simulateTyping(ctx, 1000);
+    await ctx.reply(
+      "No problem! Just tell me what you'd like to update and I'll fix it right away 😊",
+      { parse_mode: "Markdown" }
+    );
+    addToHistory(state, "Bot", "Asked user what they want to change.");
+
+    // TODO: For a more advanced implementation, parse the edit request
+    // and update specific fields. For now, the user can type /restart.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Utility: send a message and track in history
+// ---------------------------------------------------------------------------
+
+async function sendBotMessage(ctx, state, rawText, keyboard = null) {
+  let text = rawText;
   
-  // Ensure the Undo button is on a new row
-  if (options.length % 2 !== 0) keyboard.row();
-  keyboard.text("↩️ Undo Last Question", "undo");
+  // 1. Parse Reactions
+  const reactMatch = text.match(/\[REACT:\s*(.+?)\]/i);
+  if (reactMatch) {
+    const emoji = reactMatch[1].trim();
+    text = text.replace(reactMatch[0], "").trim();
+    try {
+      await ctx.react(emoji);
+    } catch (e) {
+      console.error("[Reactions] Failed to react:", e.message);
+    }
+  }
 
-  return keyboard;
+  // 2. Parse Stickers
+  const stickerMatch = text.match(/\[STICKER:\s*(.+?)\]/i);
+  let stickerEmoji = null;
+  if (stickerMatch) {
+    stickerEmoji = stickerMatch[1].trim();
+    text = text.replace(stickerMatch[0], "").trim();
+  }
+
+  // 3. Typo Illusion (5% chance)
+  let typoCorrection = null;
+  if (Math.random() < 0.05 && text.length > 20 && !text.includes("http")) {
+    if (text.includes("you're")) {
+       text = text.replace("you're", "your");
+       typoCorrection = "*you're";
+    } else if (text.includes("their")) {
+       text = text.replace("their", "there");
+       typoCorrection = "*their";
+    } else if (text.includes("too ")) {
+       text = text.replace("too ", "to ");
+       typoCorrection = "*too";
+    }
+  }
+
+  const messages = splitMessages(text, 4000);
+
+  for (let i = 0; i < messages.length; i++) {
+    if (i > 0) {
+      await simulateTyping(ctx, calculateTypingDelay(messages[i]));
+    }
+    const options = { parse_mode: "HTML" };
+    // Only attach keyboard to the very last text chunk if no sticker/typo follows
+    if (keyboard && i === messages.length - 1 && !stickerEmoji && !typoCorrection) {
+      options.reply_markup = keyboard;
+    }
+    try {
+      await ctx.reply(messages[i], options);
+    } catch {
+      await ctx.reply(messages[i]);
+    }
+    if (i < messages.length - 1) {
+      await delay(400);
+    }
+  }
+
+  // Send Sticker if any
+  if (stickerEmoji) {
+    await simulateTyping(ctx, 600);
+    const options = {};
+    if (keyboard && !typoCorrection) options.reply_markup = keyboard;
+    await ctx.reply(stickerEmoji, options);
+  }
+
+  // Send Correction if any
+  if (typoCorrection) {
+    await simulateTyping(ctx, 1200);
+    const options = {};
+    if (keyboard) options.reply_markup = keyboard;
+    await ctx.reply(typoCorrection, options);
+  }
+
+  addToHistory(state, "Bot", rawText);
+}
+
+// ---------------------------------------------------------------------------
+// PM Features: Voice & Callbacks
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle incoming voice notes
+ */
+export async function handleVoice(ctx) {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  if (state.completed) {
+    await ctx.reply("You've already completed the onboarding! 🎉");
+    return;
+  }
+  
+  await ctx.api.sendChatAction(chatId, "typing");
+  
+  try {
+    const file = await ctx.getFile();
+    const url = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+    
+    const tmpPath = path.join(os.tmpdir(), `voice_${chatId}_${Date.now()}.ogg`);
+    fs.writeFileSync(tmpPath, Buffer.from(buffer));
+    
+    await simulateTyping(ctx, 1000);
+    const text = await transcribeAudio(tmpPath);
+    fs.unlinkSync(tmpPath);
+    
+    await ctx.reply(`<i>🎙 Transcribed: "${text}"</i>`, { parse_mode: "HTML" });
+    
+    await processUserMessage(ctx, text);
+  } catch (err) {
+    console.error("[Voice] Error processing voice note:", err);
+    await ctx.reply("Sorry, I had trouble processing that voice note. Could you type it out instead?");
+  }
 }
 
 /**
- * Creates a keyboard with just a Skip and Undo button for optional questions.
+ * Handle inline keyboard button clicks
  */
-export function createSkipKeyboard() {
-  const keyboard = new InlineKeyboard();
-  keyboard.text("⏭️ Skip this question", "skip");
-  keyboard.row();
-  keyboard.text("↩️ Undo Last Question", "undo");
-  return keyboard;
+export async function handleCallbackQuery(ctx) {
+  const data = ctx.callbackQuery?.data;
+  if (!data) return;
+  
+  if (data === "undo") {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    await handleUndo(ctx);
+    return;
+  }
+
+  if (data === "skip") {
+    await ctx.answerCallbackQuery({ text: "Skipped! ⏭️" });
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    
+    // Actually advance past the current optional question group
+    const chatId = ctx.chat.id;
+    const state = getState(chatId);
+    if (!state.completed) {
+      // Mark all optional fields in current group with a skip sentinel
+      const groupFields = getCurrentGroupFields(state);
+      for (const f of groupFields) {
+        if (!f.required && (state.data[f.key] === undefined || state.data[f.key] === null)) {
+          state.data[f.key] = null; // explicitly null = user skipped
+        }
+      }
+      // Advance to next group
+      const section = getCurrentSection(state);
+      if (section && state.currentGroupIndex < section.grouping.length - 1) {
+        state.currentGroupIndex++;
+      } else {
+        advance(state);
+      }
+      // Ask next question naturally via LLM
+      await processUserMessage(ctx, "let's move on");
+    }
+    return;
+  }
+
+  if (!data.startsWith("ans_")) return;
+  
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  if (state.completed) {
+    await ctx.answerCallbackQuery({ text: "You've already finished onboarding!" });
+    return;
+  }
+  
+  const parts = data.split("_");
+  const idx = parseInt(parts.pop(), 10);
+  const fieldKey = parts.slice(1).join("_");
+  
+  let field = null;
+  for (const sec of SECTIONS) {
+    const f = sec.fields.find(x => x.key === fieldKey);
+    if (f) {
+      field = f;
+      break;
+    }
+  }
+  
+  if (field && field.options && field.options[idx]) {
+    const answer = field.options[idx];
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    await ctx.reply(`👉 ${answer}`);
+    
+    await processUserMessage(ctx, answer);
+  } else {
+    await ctx.answerCallbackQuery({ text: "Invalid option." });
+  }
 }
 
 /**
- * Builds a visual text progress bar.
- * @param {number} completed - Number of sections completed
- * @param {number} total - Total number of sections
- * @returns {string}
+ * Handle the /undo command or "Undo" button — silently restores state
+ * and naturally re-asks the last question without any system message.
  */
-export function buildProgressBar(completed, total) {
-  const filled = Math.round((completed / total) * 10);
-  const empty = 10 - filled;
-  return "🟢".repeat(filled) + "⚪".repeat(empty);
+export async function handleUndo(ctx) {
+  const chatId = ctx.chat.id;
+  const state = getState(chatId);
+  
+  if (state.stateHistory && state.stateHistory.length > 0) {
+    const previousState = state.stateHistory.pop();
+    state.currentSectionIndex = previousState.currentSectionIndex;
+    state.currentGroupIndex = previousState.currentGroupIndex;
+    state.data = previousState.data;
+    state.awaitingPhoto = previousState.awaitingPhoto;
+    state.completed = previousState.completed;
+    
+    // No system message — just naturally re-ask the question like a human would
+    await simulateTyping(ctx, 900);
+    const missing = getMissingFieldsInGroup(state);
+    
+    if (missing.length > 0) {
+      const undoPhrases = [
+        "wait my bad, let me re-ask that —",
+        "hold on actually, let me go back —",
+        "sorry, let me redo that question —",
+        "wait actually, ignore that last one —",
+      ];
+      const prefix = undoPhrases[Math.floor(Math.random() * undoPhrases.length)];
+      let keyboard = null;
+      if (missing[0].options && missing[0].options.length <= 12) {
+        keyboard = createOptionsKeyboard(missing[0].key, missing[0].options);
+      }
+      await sendBotMessage(ctx, state, `${prefix} ${missing[0].question}`, keyboard);
+    } else {
+      await ctx.reply("okay let's keep going");
+    }
+  } else {
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery({ text: "nothing to undo!" });
+    } else {
+      await ctx.reply("nothing to undo!");
+    }
+  }
 }
