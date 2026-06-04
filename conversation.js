@@ -74,11 +74,23 @@ function getState(chatId) {
       startedAt: Date.now(),
       lastActivity: Date.now(),
       stateHistory: [],
+      nudgeSent: false,
     });
   }
   const state = userStates.get(chatId);
   state.lastActivity = Date.now();
   return state;
+}
+
+/**
+ * Returns users who have been inactive for more than `thresholdMs` and are
+ * not yet completed and haven't been nudged yet.
+ */
+export function getInactiveUsers(thresholdMs = 3 * 60 * 60 * 1000) {
+  const now = Date.now();
+  return [...userStates.values()].filter(
+    (s) => !s.completed && !s.nudgeSent && (now - s.lastActivity) > thresholdMs
+  );
 }
 
 function resetState(chatId) {
@@ -669,6 +681,10 @@ async function handleReviewResponse(ctx, state, userMessage) {
       `Welcome to the Mealzy family! 💚`,
       { parse_mode: "HTML" }
     );
+    
+    // Warm follow up 5 seconds later
+    await delay(5000);
+    await ctx.reply(`I'll be right here if you need anything else before your plan drops. Go get some rest! 😌`);
 
     // Forward the completed data if FORWARD_CHAT_ID is set
     if (FORWARD_CHAT_ID) {
@@ -805,8 +821,28 @@ export async function handleCallbackQuery(ctx) {
   if (data === "skip") {
     await ctx.answerCallbackQuery({ text: "Skipped! ⏭️" });
     await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {});
-    // Treat "skip" as if the user typed "skip" — the LLM will handle it gracefully
-    await processUserMessage(ctx, "skip");
+    
+    // Actually advance past the current optional question group
+    const chatId = ctx.chat.id;
+    const state = getState(chatId);
+    if (!state.completed) {
+      // Mark all optional fields in current group with a skip sentinel
+      const groupFields = getCurrentGroupFields(state);
+      for (const f of groupFields) {
+        if (!f.required && (state.data[f.key] === undefined || state.data[f.key] === null)) {
+          state.data[f.key] = null; // explicitly null = user skipped
+        }
+      }
+      // Advance to next group
+      const section = getCurrentSection(state);
+      if (section && state.currentGroupIndex < section.grouping.length - 1) {
+        state.currentGroupIndex++;
+      } else {
+        advance(state);
+      }
+      // Ask next question naturally via LLM
+      await processUserMessage(ctx, "let's move on");
+    }
     return;
   }
 
@@ -845,7 +881,8 @@ export async function handleCallbackQuery(ctx) {
 }
 
 /**
- * Handle the /undo command or "Undo" button
+ * Handle the /undo command or "Undo" button — silently restores state
+ * and naturally re-asks the last question without any system message.
  */
 export async function handleUndo(ctx) {
   const chatId = ctx.chat.id;
@@ -859,27 +896,31 @@ export async function handleUndo(ctx) {
     state.awaitingPhoto = previousState.awaitingPhoto;
     state.completed = previousState.completed;
     
-    await simulateTyping(ctx, 1000);
-    await ctx.reply("⏪ <i>Undoing your last answer...</i>", { parse_mode: "HTML" });
-    
-    // Check what is missing now and ask
-    const section = getCurrentSection(state);
+    // No system message — just naturally re-ask the question like a human would
+    await simulateTyping(ctx, 900);
     const missing = getMissingFieldsInGroup(state);
     
     if (missing.length > 0) {
+      const undoPhrases = [
+        "wait my bad, let me re-ask that —",
+        "hold on actually, let me go back —",
+        "sorry, let me redo that question —",
+        "wait actually, ignore that last one —",
+      ];
+      const prefix = undoPhrases[Math.floor(Math.random() * undoPhrases.length)];
       let keyboard = null;
       if (missing[0].options && missing[0].options.length <= 12) {
         keyboard = createOptionsKeyboard(missing[0].key, missing[0].options);
       }
-      await sendBotMessage(ctx, state, missing[0].question, keyboard);
+      await sendBotMessage(ctx, state, `${prefix} ${missing[0].question}`, keyboard);
     } else {
-      await ctx.reply("Ready to continue! Just say 'hi' or tell me your answer.");
+      await ctx.reply("okay let's keep going");
     }
   } else {
     if (ctx.callbackQuery) {
-      await ctx.answerCallbackQuery({ text: "Can't go back any further!" });
+      await ctx.answerCallbackQuery({ text: "nothing to undo!" });
     } else {
-      await ctx.reply("Can't go back any further!");
+      await ctx.reply("nothing to undo!");
     }
   }
 }
