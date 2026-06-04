@@ -17,7 +17,7 @@ if (!process.env.GROQ_API_KEY) {
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
 bot.use(session({
-  initial: () => ({ step: -1, data: {}, multiSelectState: [], waitingForLLM: false }),
+  initial: () => ({ step: -1, data: {}, multiSelectState: [], waitingForLLM: false, history: [] }),
 }));
 
 function currentStep(ctx) {
@@ -95,6 +95,7 @@ bot.command('start', async (ctx) => {
   ctx.session.data = {};
   ctx.session.multiSelectState = [];
   ctx.session.waitingForLLM = false;
+  ctx.session.history = [];
 
   const botName = process.env.BOT_NAME || 'Avni';
   await ctx.reply(
@@ -109,6 +110,7 @@ bot.command('restart', async (ctx) => {
   ctx.session.data = {};
   ctx.session.multiSelectState = [];
   ctx.session.waitingForLLM = false;
+  ctx.session.history = [];
   await ctx.reply("Starting over from the beginning!");
   await sendStep(ctx, STEPS[0]);
 });
@@ -168,28 +170,31 @@ bot.on('message:text', async (ctx) => {
     const result = await validateAndReply({
       question: step.question,
       expectedType: step.expectedType,
-      hint: step.hint,
       userMessage: ctx.message.text,
       nextQuestion: nextStepQuestion(ctx),
+      history: ctx.session.history,
     });
+
+    // keep last 8 exchanges so bot remembers context
+    ctx.session.history.push(
+      { role: 'user', content: ctx.message.text },
+      { role: 'assistant', content: result.reply }
+    );
+    if (ctx.session.history.length > 16) {
+      ctx.session.history = ctx.session.history.slice(-16);
+    }
 
     if (result.advance) {
       ctx.session.data[step.key] = result.extractedValue;
-      // advance first so we know the next step type
       ctx.session.step++;
       const nextStep = STEPS[ctx.session.step];
-      // send LLM reply (already contains next question for text steps)
       await ctx.reply(result.reply, { parse_mode: 'Markdown' });
-      // only send next step separately if it needs buttons/keyboard (can't be embedded)
-      if (nextStep && nextStep.type !== 'text') {
-        if (ctx.session.step >= STEPS.length) {
-          await finish(ctx);
-        } else {
-          await sendStep(ctx, nextStep);
-        }
-      } else if (!nextStep) {
+      if (!nextStep) {
         await finish(ctx);
+      } else if (nextStep.type !== 'text') {
+        await sendStep(ctx, nextStep);
       }
+      // next text step already asked in LLM reply — no extra message needed
     } else {
       await ctx.reply(result.reply);
     }
